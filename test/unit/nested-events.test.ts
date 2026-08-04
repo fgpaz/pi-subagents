@@ -150,7 +150,7 @@ describe("nested event parsing and projection", () => {
 			ts: 100,
 			parentRunId: "root-run",
 			parentStepIndex: 1,
-			child: child("nested-a", "running", 100),
+			child: { ...child("nested-a", "running", 100), model: "provider/gpt-5.6-luna:medium", thinking: "medium", steps: [{ agent: "leaf", status: "running", model: "provider/leaf", thinking: "low" }] },
 		});
 		writeNestedEvent(route, {
 			type: "subagent.nested.updated",
@@ -176,6 +176,10 @@ describe("nested event parsing and projection", () => {
 		assert.equal(registry.children[0]?.id, "nested-a");
 		assert.equal(registry.children[0]?.state, "complete");
 		assert.equal(registry.children[0]?.steps?.[0]?.agent, "leaf");
+		assert.equal(registry.children[0]?.model, "provider/gpt-5.6-luna:medium");
+		assert.equal(registry.children[0]?.thinking, "medium");
+		assert.equal(registry.children[0]?.steps?.[0]?.model, "provider/leaf");
+		assert.equal(registry.children[0]?.steps?.[0]?.thinking, "low");
 		assert.deepEqual(registry.children[0]?.runtimeAcknowledgedExtensions, {
 			version: 1,
 			source: "child-runtime",
@@ -338,6 +342,40 @@ describe("nested event parsing and projection", () => {
 		assert.equal(records[0]?.child.id, "jsonl-good");
 	});
 
+
+	it("sanitizes nested model bounds and thinking levels", () => {
+		const route = trackRoute();
+		writeNestedEvent(route, {
+			type: "subagent.nested.updated",
+			ts: 100,
+			parentRunId: "root-run",
+			parentStepIndex: 1,
+			child: {
+				...child("nested-model-bounds", "running", 100),
+				model: "m".repeat(600),
+				thinking: "turbo",
+				steps: [{ agent: "leaf", status: "running", model: "worker", thinking: "xhigh" }],
+			},
+		});
+		const summary = projectNestedEvents(route).children[0]!;
+		assert.equal(summary.model?.length, 512);
+		assert.equal(summary.thinking, undefined);
+		assert.equal(summary.steps?.[0]?.thinking, "xhigh");
+	});
+
+	it("projects effective model and thinking from async status, including a single-step run", () => {
+		const summary = nestedSummaryFromAsyncStatus({
+			runId: "child-run",
+			mode: "single",
+			state: "running",
+			startedAt: 1,
+			steps: [{ agent: "worker", status: "running", model: "provider/worker", thinking: "high" }],
+		}, "/tmp/child-run", { id: "child-run", parentRunId: "parent-run", depth: 1, mode: "single", ts: 2 });
+		assert.equal(summary.model, "provider/worker");
+		assert.equal(summary.thinking, "high");
+		assert.equal(summary.steps?.[0]?.model, "provider/worker");
+		assert.equal(summary.steps?.[0]?.thinking, "high");
+	});
 
 	it("sanitizes malformed process-terminal proofs in nested status summaries", () => {
 		const summary = nestedSummaryFromAsyncStatus({

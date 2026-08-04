@@ -2,6 +2,9 @@
 
 ## [Unreleased]
 
+### Added
+- FleetView nested trees now retain and display each leaf's effective model and thinking effort, including completed siblings while the owner remains active.
+
 ## [0.40.0] - 2026-08-01
 
 ### Added

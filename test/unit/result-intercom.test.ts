@@ -133,7 +133,10 @@ describe("result intercom formatter", () => {
 				path: [{ runId: "root-run", stepIndex: 1 }],
 				state: "complete",
 				agent: "reviewer",
+				model: "provider/gpt-5.6-luna:medium",
+				thinking: "medium",
 				sessionFile: path.join(os.tmpdir(), "nested-a.jsonl"),
+				steps: [{ agent: "leaf", status: "complete", model: "provider/leaf", thinking: "low" }],
 				controlInbox: "/tmp/should-not-leak",
 				capabilityToken: "secret-token",
 				children: [{
@@ -153,6 +156,10 @@ describe("result intercom formatter", () => {
 		const grandchild = nested?.children?.[0];
 		assert.equal(payload.children[0]?.children, undefined);
 		assert.equal(nested?.id, "nested-a");
+		assert.equal(nested?.model, "provider/gpt-5.6-luna:medium");
+		assert.equal(nested?.thinking, "medium");
+		assert.equal(nested?.steps?.[0]?.model, "provider/leaf");
+		assert.equal(nested?.steps?.[0]?.thinking, "low");
 		assert.equal(Object.hasOwn(nested ?? {}, "controlInbox"), false);
 		assert.equal(Object.hasOwn(nested ?? {}, "capabilityToken"), false);
 		assert.equal(grandchild?.id, "nested-grandchild");
