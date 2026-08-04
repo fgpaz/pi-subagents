@@ -150,7 +150,7 @@ describe("nested event parsing and projection", () => {
 			ts: 100,
 			parentRunId: "root-run",
 			parentStepIndex: 1,
-			child: { ...child("nested-a", "running", 100), model: "provider/gpt-5.6-luna:medium", thinking: "medium", steps: [{ agent: "leaf", status: "running", model: "provider/leaf", thinking: "low" }] },
+			child: { ...child("nested-a", "running", 100), model: "provider/gpt-5.6-luna:medium", thinking: "medium", steps: [{ agent: "leaf", status: "running", model: "provider/leaf", thinking: "low" }], children: [child("nested-grandchild", "running", 100, "nested-a")] },
 		});
 		writeNestedEvent(route, {
 			type: "subagent.nested.updated",
@@ -180,6 +180,7 @@ describe("nested event parsing and projection", () => {
 		assert.equal(registry.children[0]?.thinking, "medium");
 		assert.equal(registry.children[0]?.steps?.[0]?.model, "provider/leaf");
 		assert.equal(registry.children[0]?.steps?.[0]?.thinking, "low");
+		assert.equal(registry.children[0]?.children?.[0]?.id, "nested-grandchild");
 		assert.deepEqual(registry.children[0]?.runtimeAcknowledgedExtensions, {
 			version: 1,
 			source: "child-runtime",

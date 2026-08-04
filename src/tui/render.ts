@@ -862,7 +862,7 @@ function formatNestedWidgetLines(children: NestedRunSummary[] | undefined, theme
 			const state = "status" in step ? step.status : step.state;
 			const modelThinking = formatModelThinking(step.model, step.thinking);
 			const activity = nestedActivity(step, state, snapshotNow ?? fallback);
-			const timestamp = "status" in step ? nestedStepTimestamp(step, fallback) : nestedRunEventTime(step);
+			const timestamp = "status" in step ? nestedStepTimestamp(step, fallback) : formatClockTime(nestedRunEventTime(step));
 			const error = step.error ? ` · ${step.error}` : "";
 			const name = "status" in step ? step.agent : nestedRunName(step);
 			rows.push({
