@@ -5,6 +5,14 @@
 ### Added
 - FleetView nested trees now retain and display each leaf's effective model and thinking effort, including completed siblings while the owner remains active.
 
+### Fixed
+- Windows APPDATA global discovery (upstream 89221a3).
+- Zero-activity SIGKILL retry (upstream d239ac0).
+- Nested foreground failure event preservation (upstream 9d74cba).
+- Fleet inspector disk reconciliation (upstream 65c855b).
+- Interactive resume after compaction with active async work (upstream f54af73).
+- Grouped-result intercom opt-in (upstream 43bcb01).
+
 ## [0.40.0] - 2026-08-01
 
 ### Added

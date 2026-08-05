@@ -4372,15 +4372,21 @@ export function createSubagentExecutor(deps: ExecutorDeps): {
 				: hasChain && effectiveParams.chain
 					? effectiveParams.chain.flatMap((step) => isParallelStep(step) ? step.parallel.map((task) => task.agent) : [(step as SequentialStep).agent])
 					: effectiveParams.agent ? [effectiveParams.agent] : [];
-			const declaredModels = hasTasks && effectiveParams.tasks
-				? effectiveParams.tasks.map((task) => task.model)
-				: hasChain && effectiveParams.chain
-					? effectiveParams.chain.flatMap((step) => isParallelStep(step)
-						? step.parallel.map((task) => task.model)
-						: isDynamicParallelStep(step)
-							? [step.parallel.model]
-							: [(step as SequentialStep).model])
-					: [effectiveParams.model];
+			let declaredModels: Array<string | undefined>;
+			try {
+				declaredModels = hasTasks && effectiveParams.tasks
+					? effectiveParams.tasks.map((task) => task.model)
+					: hasChain && effectiveParams.chain
+						? effectiveParams.chain.flatMap((step) => isParallelStep(step)
+							? step.parallel.map((task) => task.model)
+							: isDynamicParallelStep(step)
+								? [step.parallel.model]
+								: [(step as SequentialStep).model])
+						: [effectiveParams.model];
+			} catch (error) {
+				console.error("Failed to resolve nested foreground launch metadata:", error);
+				declaredModels = [];
+			}
 			const declaredThinking = typeof effectiveParams.thinking === "string" ? effectiveParams.thinking : undefined;
 			const leafIntercomTarget = intercomBridge.active && agentsForSummary[0]
 				? resolveSubagentIntercomTarget(runId, agentsForSummary[0], 0)

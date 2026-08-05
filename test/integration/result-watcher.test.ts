@@ -950,7 +950,7 @@ describe("result watcher", () => {
 		}
 	});
 
-	it("logs one unacknowledged grouped async intercom delivery before completing", async () => {
+	it("uses local completion fallback silently when no grouped-result listener is available", async () => {
 		const resultsDir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-result-watcher-"));
 		try {
 			const emitted: Array<{ event: string; data: unknown }> = [];
@@ -966,7 +966,7 @@ describe("result watcher", () => {
 			};
 			const state = createState();
 			state.currentSessionId = "session-1";
-			const watcher = createResultWatcher(pi, state, resultsDir, 60_000);
+			const watcher = createResultWatcher(pi, state, resultsDir, 60_000, { deliverIntercomResults: false });
 			const originalError = console.error;
 			const logged: unknown[][] = [];
 			console.error = (...args: unknown[]) => {
@@ -984,23 +984,64 @@ describe("result watcher", () => {
 					intercomTarget: "orchestrator",
 				}), "utf-8");
 				watcher.primeExistingResults();
-				const deadline = Date.now() + 1000;
-				while (true) {
-					const sawWarning = logged.some((entry) => /Subagent async grouped result intercom delivery was not acknowledged/.test(String(entry[0] ?? "")));
-					const sawCompletion = emitted.some((entry) => entry.event === "subagent:async-complete");
-					if ((sawWarning && sawCompletion) || Date.now() > deadline) break;
-					await new Promise((resolve) => setTimeout(resolve, 25));
-				}
+				await new Promise((resolve) => setTimeout(resolve, 100));
 			} finally {
 				console.error = originalError;
 				watcher.stopResultWatcher();
 			}
 
-			const grouped = emitted.filter((entry) => entry.event === "subagent:result-intercom");
-			assert.equal(grouped.length, 1);
-			assert.match(String((grouped[0]?.data as { message?: string } | undefined)?.message ?? ""), /output unknown/);
-			assert.doesNotMatch(String((grouped[0]?.data as { message?: string } | undefined)?.message ?? ""), /Inspect that output before retrying/);
+			assert.equal(emitted.some((entry) => entry.event === "subagent:result-intercom"), false);
 			assert.equal(emitted.some((entry) => entry.event === "subagent:async-complete"), true);
+			assert.equal(logged.some((entry) => /Subagent async grouped result intercom delivery was not acknowledged/.test(String(entry[0] ?? ""))), false);
+		} finally {
+			fs.rmSync(resultsDir, { recursive: true, force: true });
+		}
+	});
+
+	it("warns when an available grouped-result listener does not acknowledge delivery", async () => {
+		const resultsDir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-result-watcher-unacknowledged-listener-"));
+		try {
+			const emitted: Array<{ event: string; data: unknown }> = [];
+			const listeners = new Map<string, Set<(payload: unknown) => void>>();
+			const pi = {
+				events: {
+					on(event: string, handler: (payload: unknown) => void) {
+						const eventListeners = listeners.get(event) ?? new Set();
+						eventListeners.add(handler);
+						listeners.set(event, eventListeners);
+						return () => eventListeners.delete(handler);
+					},
+					emit(event: string, data: unknown) {
+						emitted.push({ event, data });
+						for (const handler of listeners.get(event) ?? []) handler(data);
+					},
+				},
+			};
+			const state = createState();
+			state.currentSessionId = "session-1";
+			const watcher = createResultWatcher(pi, state, resultsDir, 60_000);
+			const originalError = console.error;
+			const logged: unknown[][] = [];
+			console.error = (...args: unknown[]) => { logged.push(args); };
+			try {
+				fs.writeFileSync(path.join(resultsDir, "unacknowledged.json"), JSON.stringify({
+					id: "unacknowledged",
+					runId: "run-unacknowledged",
+					agent: "worker",
+					success: true,
+					state: "complete",
+					summary: "Worker summary",
+					sessionId: "session-1",
+					intercomTarget: "orchestrator",
+				}), "utf-8");
+				watcher.primeExistingResults();
+				await new Promise((resolve) => setTimeout(resolve, 600));
+			} finally {
+				console.error = originalError;
+				watcher.stopResultWatcher();
+			}
+
+			assert.equal(emitted.filter((entry) => entry.event === "subagent:result-intercom").length, 1);
 			assert.equal(logged.some((entry) => /Subagent async grouped result intercom delivery was not acknowledged/.test(String(entry[0] ?? ""))), true);
 		} finally {
 			fs.rmSync(resultsDir, { recursive: true, force: true });

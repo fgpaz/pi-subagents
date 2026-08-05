@@ -239,7 +239,7 @@ export default function registerSubagentExtension(pi: ExtensionAPI): void {
 		? new SubagentFleetStatus(state, async (itemKey) => {
 			const ctx = state.lastUiContext;
 			if (!ctx?.hasUI) return;
-			await openSubagentFleet(ctx, state, { initialKey: itemKey });
+			await openSubagentFleet(ctx, state, { initialKey: itemKey, asyncDirRoot: ASYNC_DIR, resultsDir: RESULTS_DIR });
 		}, { placement: fleetViewPlacement })
 		: undefined;
 	const { startResultWatcher, primeExistingResults, stopResultWatcher } = createResultWatcher(
@@ -249,7 +249,7 @@ export default function registerSubagentExtension(pi: ExtensionAPI): void {
 		10 * 60 * 1000,
 		{
 			notifier: completionNotifier,
-			deliverIntercomResults: config.intercomBridge?.resultDelivery !== false,
+			deliverIntercomResults: config.intercomBridge?.resultDelivery === true,
 		},
 	);
 
@@ -568,6 +568,19 @@ export default function registerSubagentExtension(pi: ExtensionAPI): void {
 		primeExistingResults({ triggerTurn: !recovering });
 		fleetStatus?.setContext(ctx);
 	};
+
+	pi.on("session_compact", () => {
+		const hasActiveAsyncWork = [...state.asyncJobs.values()].some((job) => job.status === "queued" || job.status === "running");
+		if (!hasActiveAsyncWork || state.lastUiContext?.hasUI !== true) return;
+		pi.sendMessage(
+			{
+				customType: "subagent-compaction-resume",
+				content: "Compaction is complete. Resume the parent task now; background subagent results will arrive separately when ready.",
+				display: false,
+			},
+			{ triggerTurn: true },
+		);
+	});
 
 	pi.on("session_start", (event, ctx) => {
 		const recovering = event.reason === "startup" || event.reason === "reload" || event.reason === "resume";

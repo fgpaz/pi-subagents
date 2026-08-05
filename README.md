@@ -1704,7 +1704,7 @@ Fields:
 
 - `mode`: default `always`; use `fork-only` to inject only for forked runs, or `off` to disable the bridge.
 - `instructionFile`: optional Markdown template replacing the default bridge instructions. `{orchestratorTarget}` is interpolated. Relative paths resolve from `~/.pi/agent/extensions/subagent/`.
-- `resultDelivery`: default `true`; attempts acknowledged grouped completion delivery through an external `subagent:result-intercom` listener. Set `false` when native parent notifications own completion delivery. Supervisor asks/progress remain active, and genuine enabled-transport acknowledgement failures remain visible.
+- `resultDelivery`: default `false`; set `true` only when an external `subagent:result-intercom` listener is installed. Enabled delivery waits for acknowledgement and reports acknowledgement failures. Supervisor asks/progress remain active.
 
 Bridge activation requires a targetable current parent session id, which `pi-subagents` passes to children automatically. It no longer depends on an external `pi-intercom` installation or per-agent extension allowlists.
 

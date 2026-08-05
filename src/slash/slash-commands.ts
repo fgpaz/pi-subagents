@@ -42,6 +42,7 @@ import {
 	SLASH_SUBAGENT_STARTED_EVENT,
 	SLASH_SUBAGENT_UPDATE_EVENT,
 	ASYNC_DIR,
+	RESULTS_DIR,
 	type Details,
 	type JsonSchemaObject,
 	type SingleResult,
@@ -1172,7 +1173,7 @@ export function registerSlashCommands(
 		}
 		fleetOpen = true;
 		try {
-			await openSubagentFleet(ctx, state);
+			await openSubagentFleet(ctx, state, { asyncDirRoot: ASYNC_DIR, resultsDir: RESULTS_DIR });
 		} finally {
 			fleetOpen = false;
 		}

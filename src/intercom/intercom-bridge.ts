@@ -81,12 +81,12 @@ export function resolveIntercomBridgeMode(value: unknown): IntercomBridgeMode {
 
 function resolveIntercomBridgeConfig(value: ExtensionConfig["intercomBridge"]): Required<IntercomBridgeConfig> {
 	if (!value || typeof value !== "object" || Array.isArray(value)) {
-		return { mode: "always", instructionFile: "", resultDelivery: true };
+		return { mode: "always", instructionFile: "", resultDelivery: false };
 	}
 	return {
 		mode: resolveIntercomBridgeMode(value.mode),
 		instructionFile: typeof value.instructionFile === "string" ? value.instructionFile : "",
-		resultDelivery: value.resultDelivery !== false,
+		resultDelivery: value.resultDelivery === true,
 	};
 }
 
