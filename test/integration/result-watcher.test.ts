@@ -984,7 +984,10 @@ describe("result watcher", () => {
 					intercomTarget: "orchestrator",
 				}), "utf-8");
 				watcher.primeExistingResults();
-				await new Promise((resolve) => setTimeout(resolve, 100));
+				const deadline = Date.now() + 3_000;
+				while (!emitted.some((entry) => entry.event === "subagent:async-complete") && Date.now() < deadline) {
+					await new Promise((resolve) => setTimeout(resolve, 25));
+				}
 			} finally {
 				console.error = originalError;
 				watcher.stopResultWatcher();
@@ -1035,7 +1038,10 @@ describe("result watcher", () => {
 					intercomTarget: "orchestrator",
 				}), "utf-8");
 				watcher.primeExistingResults();
-				await new Promise((resolve) => setTimeout(resolve, 600));
+				const deadline = Date.now() + 3_000;
+				while (!logged.some((entry) => /Subagent async grouped result intercom delivery was not acknowledged/.test(String(entry[0] ?? ""))) && Date.now() < deadline) {
+					await new Promise((resolve) => setTimeout(resolve, 25));
+				}
 			} finally {
 				console.error = originalError;
 				watcher.stopResultWatcher();
