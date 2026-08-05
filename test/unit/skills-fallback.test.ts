@@ -354,6 +354,7 @@ describe("skills filesystem fallback", () => {
 					...process.env,
 					HOME: fakeHome,
 					USERPROFILE: fakeHome,
+					APPDATA: path.join(fakeHome, "appdata"),
 					PATH: `${binDir}${path.delimiter}${process.env.PATH ?? ""}`,
 					PI_DISCOVERY_MARKER: marker,
 					PI_OFFLINE: "1",
@@ -432,6 +433,11 @@ Windows global agent.
 			{ encoding: "utf-8", mode: 0o755 },
 		);
 		fs.writeFileSync(
+			path.join(binDir, "npm.cmd"),
+			`@echo off\r\n>>"${marker}" echo npm-called\r\necho ${fallbackRoot}\r\n`,
+			"utf-8",
+		);
+		fs.writeFileSync(
 			path.join(binDir, "cmd.exe"),
 			`#!/bin/sh\nexec sh -c "npm root -g"\n`,
 			{ encoding: "utf-8", mode: 0o755 },
@@ -463,7 +469,7 @@ Fallback global agent.
 			Object.defineProperty(process, "platform", { value: "win32" });
 			process.env.APPDATA = appData;
 			process.env.PATH = `${binDir}${path.delimiter}${previousPath ?? ""}`;
-			process.env.ComSpec = path.join(binDir, "cmd.exe");
+			if (platformDescriptor?.value !== "win32") process.env.ComSpec = path.join(binDir, "cmd.exe");
 
 			const skills = await importSkillsFresh();
 			assert.ok(skills.discoverAvailableSkills(tempDir).some((skill) => skill.name === "fallback-global-skill"));
