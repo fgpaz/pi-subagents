@@ -10,6 +10,7 @@ describe("writer budget guidance", () => {
 		const readme = readProjectFile("README.md");
 		const skill = readProjectFile("skills/pi-subagents/SKILL.md");
 		const reviewLoop = readProjectFile("prompts/review-loop.md");
+		const policy = readProjectFile("src/runs/shared/writer-budget-policy.ts");
 
 		for (const text of [readme, skill, reviewLoop]) {
 			assert.match(text, /As a conservative orchestration policy, do not (?:pass|set) `turnBudget`(?:, a hard `toolBudget`, or a tight `usageBudget`| or a hard `toolBudget`)/);
@@ -20,6 +21,10 @@ describe("writer budget guidance", () => {
 			assert.match(text, /commit or PR state/);
 		}
 		assert.match(readme, /elapsed timeout is not a mutation-safe boundary/i);
+		// Runtime enforcement (not guidance-only): strip path exists for mutation launches.
+		assert.match(policy, /applyWriterBudgetPolicy/);
+		assert.match(policy, /mutation-capable/);
+		assert.match(policy, /partial_delivery/);
 	});
 
 	it("documents deferred hard-limit termination at tool-using boundaries", () => {

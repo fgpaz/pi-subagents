@@ -89,6 +89,7 @@ import {
 import { acceptanceFailureMessage, buildSkippedAcceptanceLedger, evaluateAcceptance, formatAcceptancePrompt, resolveEffectiveAcceptance, stripAcceptanceReport } from "../shared/acceptance.ts";
 import { attachContractProjections, isAgentContractV1 } from "../shared/agent-contract.ts";
 import { appendTurnBudgetSystemPrompt, formatTurnBudgetOutput, initialTurnBudgetState, turnBudgetDecision, turnBudgetDeferredNote, turnBudgetDeferredState, turnBudgetExceededMessage, turnBudgetSoftNote, turnBudgetState } from "../shared/turn-budget.ts";
+import { formatPartialDeliveryTurnBudgetMessage } from "../shared/writer-budget-policy.ts";
 import { initialToolBudgetState, toolBudgetState } from "../shared/tool-budget.ts";
 import { resolveWatchdogConfig } from "../../watchdog/settings.ts";
 import { agentDefinitionDigest, launchBindingDigest } from "../../shared/launch-contract.ts";
@@ -1236,7 +1237,14 @@ async function runSingleAttempt(
 			? `${timeoutMessage}\n\nPartial output before timeout:\n${fullOutput}`
 			: timeoutMessage;
 	} else if (result.turnBudgetExceeded && result.turnBudget) {
-		fullOutput = formatTurnBudgetOutput(turnBudgetExceededMessage(result.turnBudget, result.turnBudget.turnCount), fullOutput);
+		const budgetMessage = formatPartialDeliveryTurnBudgetMessage(
+			turnBudgetExceededMessage(result.turnBudget, result.turnBudget.turnCount),
+			observedMutationAttempt,
+		);
+		fullOutput = formatTurnBudgetOutput(budgetMessage, fullOutput);
+		if (observedMutationAttempt) {
+			result.error = budgetMessage;
+		}
 	} else if (result.turnBudget?.outcome === "termination-deferred") {
 		const note = turnBudgetDeferredNote(result.turnBudget, result.turnBudget.terminationDeferredAtTurn ?? result.turnBudget.turnCount);
 		fullOutput = fullOutput.trim() ? `${note}\n\n${fullOutput}` : note;

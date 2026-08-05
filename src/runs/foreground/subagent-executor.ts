@@ -52,6 +52,13 @@ import { resolveCurrentSessionId } from "../../shared/session-identity.ts";
 import { applyIntercomBridgeToAgent, INTERCOM_BRIDGE_MARKER, resolveIntercomBridge, resolveIntercomSessionTarget, resolveSubagentIntercomTarget, type IntercomBridgeState } from "../../intercom/intercom-bridge.ts";
 import { formatControlIntercomMessage, formatControlNoticeMessage, resolveControlConfig, shouldNotifyControlEvent } from "../shared/subagent-control.ts";
 import { resolveTurnBudgetConfig } from "../shared/turn-budget.ts";
+import {
+	agentLooksMutationCapable,
+	applyWriterBudgetPolicy,
+	formatWriterBudgetStripNote,
+	shouldSkipConfigTurnBudget,
+	shouldSkipDefaultTurnBudget,
+} from "../shared/writer-budget-policy.ts";
 import { formatSpawnBudget, getSpawnBudgetSnapshot, grantSpawnBudget, preflightSpawnBudget, preflightSpawnBudgetGrant, reserveSpawnBudget } from "../shared/spawn-budget.ts";
 import { validateToolBudgetConfig } from "../shared/tool-budget.ts";
 import { usageBudgetExceededMessage, usageBudgetState, validateUsageBudgetConfig } from "../shared/usage-budget.ts";
@@ -1794,13 +1801,14 @@ function applySingleAgentLaunchDefaults(params: SubagentParamsLike, agents: Agen
 	if ((params.chain?.length ?? 0) > 0 || (params.tasks?.length ?? 0) > 0 || !params.agent) return params;
 	const agent = agents.find((candidate) => candidate.name === params.agent);
 	if (!agent) return params;
+	const skipDefaultTurnBudget = shouldSkipDefaultTurnBudget(agent, params.task);
 	return {
 		...params,
 		...(params.async === undefined && agent.defaultAsync !== undefined ? { async: agent.defaultAsync } : {}),
 		...(params.timeoutMs === undefined && params.maxRuntimeMs === undefined && agent.defaultTimeoutMs !== undefined
 			? { timeoutMs: agent.defaultTimeoutMs }
 			: {}),
-		...(params.turnBudget === undefined && agent.defaultTurnBudget !== undefined
+		...(params.turnBudget === undefined && agent.defaultTurnBudget !== undefined && !skipDefaultTurnBudget
 			? { turnBudget: agent.defaultTurnBudget }
 			: {}),
 		...(params.acceptance === undefined && agent.defaultAcceptance !== undefined
@@ -1838,10 +1846,27 @@ function resolveToolBudget(
 	return { toolBudget: resolved.budget, error: resolved.error };
 }
 
-function resolveEffectiveToolBudget(input: { stepBudget?: ToolBudgetConfig; runBudget?: ResolvedToolBudget; agentBudget?: ToolBudgetConfig; configBudget?: ToolBudgetConfig }): { toolBudget?: ResolvedToolBudget; error?: string } {
-	if (input.stepBudget !== undefined) return resolveToolBudget(input.stepBudget, "toolBudget");
-	if (input.runBudget !== undefined) return { toolBudget: input.runBudget };
-	if (input.agentBudget !== undefined) return resolveToolBudget(input.agentBudget, "agent.toolBudget");
+function resolveEffectiveToolBudget(input: {
+	stepBudget?: ToolBudgetConfig;
+	runBudget?: ResolvedToolBudget;
+	agentBudget?: ToolBudgetConfig;
+	configBudget?: ToolBudgetConfig;
+	/** When true, skip agent/config hard tool budgets (mutation-capable child). */
+	skipHardBudgets?: boolean;
+}): { toolBudget?: ResolvedToolBudget; error?: string } {
+	if (input.stepBudget !== undefined) {
+		if (input.skipHardBudgets) return {};
+		return resolveToolBudget(input.stepBudget, "toolBudget");
+	}
+	if (input.runBudget !== undefined) {
+		if (input.skipHardBudgets) return {};
+		return { toolBudget: input.runBudget };
+	}
+	if (input.agentBudget !== undefined) {
+		if (input.skipHardBudgets) return {};
+		return resolveToolBudget(input.agentBudget, "agent.toolBudget");
+	}
+	if (input.skipHardBudgets) return {};
 	return resolveToolBudget(input.configBudget, "config.toolBudget");
 }
 
@@ -2918,7 +2943,20 @@ async function runParallelPath(data: ExecutionContextData, deps: ExecutorDeps): 
 	);
 	const toolBudgets: (ResolvedToolBudget | undefined)[] = [];
 	for (let index = 0; index < tasks.length; index++) {
-		const resolved = resolveEffectiveToolBudget({ stepBudget: tasks[index]?.toolBudget, runBudget: data.toolBudget, agentBudget: agentConfigs[index]?.toolBudget, configBudget: data.configToolBudget });
+		const agentForBudget = agentConfigs[index];
+		const skipHardBudgets = agentLooksMutationCapable({
+			agentName: agentForBudget?.name ?? tasks[index]?.agent ?? "worker",
+			acceptanceRole: agentForBudget?.acceptanceRole,
+			tools: agentForBudget?.tools,
+			task: tasks[index]?.task,
+		});
+		const resolved = resolveEffectiveToolBudget({
+			stepBudget: tasks[index]?.toolBudget,
+			runBudget: data.toolBudget,
+			agentBudget: agentForBudget?.toolBudget,
+			configBudget: data.configToolBudget,
+			skipHardBudgets,
+		});
 		if (resolved.error) return buildParallelModeError(resolved.error);
 		toolBudgets.push(resolved.toolBudget);
 	}
@@ -3291,7 +3329,17 @@ async function runSinglePath(data: ExecutionContextData, deps: ExecutorDeps): Pr
 			details: { mode: "single", results: [] },
 		};
 	}
-	const effectiveToolBudget = resolveEffectiveToolBudget({ runBudget: data.toolBudget, agentBudget: agentConfig.toolBudget, configBudget: data.configToolBudget });
+	const effectiveToolBudget = resolveEffectiveToolBudget({
+		runBudget: data.toolBudget,
+		agentBudget: agentConfig.toolBudget,
+		configBudget: data.configToolBudget,
+		skipHardBudgets: agentLooksMutationCapable({
+			agentName: agentConfig.name,
+			acceptanceRole: agentConfig.acceptanceRole,
+			tools: agentConfig.tools,
+			task: params.task,
+		}),
+	});
 	if (effectiveToolBudget.error) return toExecutionErrorResult(params, new Error(effectiveToolBudget.error), data.contextPolicy.contextSummary);
 
 	const parentModel = data.parentModel;
@@ -4130,8 +4178,15 @@ export function createSubagentExecutor(deps: ExecutorDeps): {
 		effectiveParams = canonicalParams.params!;
 		const modelScope = discovered.modelScope;
 		effectiveParams = applySingleAgentLaunchDefaults(effectiveParams, discoveredAgents);
-		const turnBudget = resolveTurnBudgetConfig(effectiveParams.turnBudget ?? deps.config.turnBudget);
+		const writerBudget = applyWriterBudgetPolicy(effectiveParams, discoveredAgents);
+		effectiveParams = writerBudget.params;
+		const writerBudgetNote = formatWriterBudgetStripNote(writerBudget.stripped);
+		const turnBudgetSource = shouldSkipConfigTurnBudget(effectiveParams, discoveredAgents)
+			? effectiveParams.turnBudget
+			: (effectiveParams.turnBudget ?? deps.config.turnBudget);
+		const turnBudget = resolveTurnBudgetConfig(turnBudgetSource);
 		if (turnBudget.error) return buildRequestedModeError(effectiveParams, turnBudget.error);
+		void writerBudgetNote;
 		const contextPolicy = resolveAgentDefaultContextPolicy(effectiveParams, discoveredAgents);
 		effectiveParams = contextPolicy.params;
 		const sessionName = resolveIntercomSessionTarget(deps.pi.getSessionName(), ctx.sessionManager.getSessionId());

@@ -116,6 +116,7 @@ import { attachContractProjections, isAgentContractV1 } from "../shared/agent-co
 import { waitForImportedAsyncRoot } from "./chain-root-attachment.ts";
 import { appendRunnerStepsToStatus, consumeChainAppendRequests, countPendingChainAppendRequests, statusStepDescription } from "./chain-append.ts";
 import { appendTurnBudgetSystemPrompt, formatTurnBudgetOutput, initialTurnBudgetState, turnBudgetDecision, turnBudgetDeferredNote, turnBudgetDeferredState, turnBudgetExceededMessage, turnBudgetSoftNote, turnBudgetState } from "../shared/turn-budget.ts";
+import { formatPartialDeliveryTurnBudgetMessage } from "../shared/writer-budget-policy.ts";
 import { initialToolBudgetState, toolBudgetState } from "../shared/tool-budget.ts";
 import { usageBudgetExceededMessage, usageBudgetState } from "../shared/usage-budget.ts";
 import { formatParallelHandoffError, formatParallelHandoffReference, parallelHandoffPath, writeParallelHandoffGroup } from "../shared/parallel-handoff.ts";
@@ -711,10 +712,10 @@ function runPiStreaming(
 		registerTurnBudgetAbort?.((message, state) => {
 			if (settled || timedOut || stopped || turnBudgetExceeded) return;
 			turnBudgetExceeded = true;
-			turnBudgetMessage = message;
+			turnBudgetMessage = formatPartialDeliveryTurnBudgetMessage(message, observedMutationAttempt);
 			turnBudget = state;
 			interrupted = false;
-			error = message;
+			error = turnBudgetMessage;
 			trySignalChild(child, "SIGINT");
 			turnBudgetTerminationTimer = setTimeout(() => {
 				if (!settled && !timedOut && !stopped) trySignalChild(child, "SIGTERM");
@@ -1488,7 +1489,11 @@ async function runSingleStep(
 	if (finalResult?.stopped && !outputForSummary.trim()) {
 		outputForSummary = ctx.stopMessage ?? "Subagent stopped by user.";
 	} else if (!finalResult?.timedOut && !finalResult?.stopped && finalResult?.turnBudgetExceeded && turnBudget) {
-		outputForSummary = formatTurnBudgetOutput(turnBudgetExceededMessage(turnBudget, turnBudget.turnCount), outputForSummary);
+		const budgetMessage = formatPartialDeliveryTurnBudgetMessage(
+			turnBudgetExceededMessage(turnBudget, turnBudget.turnCount),
+			finalResult?.observedMutationAttempt === true,
+		);
+		outputForSummary = formatTurnBudgetOutput(budgetMessage, outputForSummary);
 	} else if (!finalResult?.timedOut && !finalResult?.stopped && turnBudget?.outcome === "termination-deferred") {
 		const note = turnBudgetDeferredNote(turnBudget, turnBudget.terminationDeferredAtTurn ?? turnBudget.turnCount);
 		outputForSummary = outputForSummary.trim() ? `${note}\n\n${outputForSummary}` : note;
@@ -1550,7 +1555,10 @@ async function runSingleStep(
 		: timedOutAfterAcceptance
 			? ctx.timeoutMessage ?? "Subagent timed out."
 			: turnBudgetExceeded
-				? finalResult?.error ?? (turnBudget ? turnBudgetExceededMessage(turnBudget, turnBudget.turnCount) : "Subagent exceeded turn budget.")
+				? finalResult?.error ?? formatPartialDeliveryTurnBudgetMessage(
+					turnBudget ? turnBudgetExceededMessage(turnBudget, turnBudget.turnCount) : "Subagent exceeded turn budget.",
+					finalResult?.observedMutationAttempt === true,
+				)
 				: acceptanceCanFailRun
 					? (finalResult?.error ? `${finalResult.error}\n${acceptanceFailure}` : acceptanceFailure)
 					: finalResult?.error;
@@ -2547,7 +2555,10 @@ async function runSubagent(
 		statusPayload.turnBudget = state;
 		if (decision !== "abort") return;
 		const exceededState = turnBudgetState(budget, turnCount, true);
-		const message = turnBudgetExceededMessage(budget, turnCount);
+		const message = formatPartialDeliveryTurnBudgetMessage(
+			turnBudgetExceededMessage(budget, turnCount),
+			Boolean((step as { observedMutationAttempt?: boolean }).observedMutationAttempt),
+		);
 		step.turnBudget = exceededState;
 		step.turnBudgetExceeded = true;
 		step.wrapUpRequested = true;
@@ -2584,6 +2595,9 @@ async function runSubagent(
 		}
 		if (event.type === "tool_execution_start" && event.toolName) {
 			const mutates = isMutatingTool(event.toolName, event.args);
+			if (mutates) {
+				(step as { observedMutationAttempt?: boolean }).observedMutationAttempt = true;
+			}
 			const currentPath = resolveCurrentPath(event.toolName, event.args);
 			step.toolCount = (step.toolCount ?? 0) + 1;
 			const configuredToolBudget = flatSteps[flatIndex]?.toolBudget;

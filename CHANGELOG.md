@@ -1,5 +1,9 @@
 # Changelog
 
+## Unreleased
+
+- **Enforce writer budget policy at launch**: strip `turnBudget` and hard `toolBudget` from mutation-capable single/parallel/chain children (workers, writers, implementation tasks). Read-only scouts/reviewers keep count caps. Prefer `timeoutMs` + narrow task scope + checkpoints for long writers. Turn-budget aborts after observed file mutations now include `partial_delivery` resume guidance.
+
 ## [Unreleased]
 
 ### Added
