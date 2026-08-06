@@ -1467,8 +1467,16 @@ async function runSingleStep(
 			attempt.error = startupError;
 			finalResult.error = startupError;
 			finalResult.finalOutput = startupError;
-			break modelAttemptsLoop;
+			// Exhausted same-model startup retries: advance to configured fallback models
+			// instead of failing the whole leaf while nan/proxy is cold.
+			if (modelIndex >= candidates.length - 1) break modelAttemptsLoop;
+			attemptNotes.push(formatModelAttemptNote({ ...attempt, error: startupError }, candidates[modelIndex + 1]));
+			modelIndex += 1;
+			startupAttemptIndex = 0;
+			continue;
 		}
+		// Provider transport errors (including bare "Connection error.") must fall through
+		// to the next candidate (Luna) when nan is down.
 		if (!isRetryableModelFailure(error) || modelIndex === candidates.length - 1) break modelAttemptsLoop;
 		attemptNotes.push(formatModelAttemptNote(attempt, candidates[modelIndex + 1]));
 		modelIndex += 1;

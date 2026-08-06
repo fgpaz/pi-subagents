@@ -1596,11 +1596,14 @@ async function runSyncCompletion(
 					result.progress.status = "failed";
 				}
 				attempt.error = startupError;
-				break modelAttemptsLoop;
+				// Exhausted same-model startup retries → try next fallback model.
+				if (modelIndex >= modelsToTry.length - 1) break modelAttemptsLoop;
+				attemptNotes.push(formatModelAttemptNote({ ...attempt, error: startupError }, modelsToTry[modelIndex + 1]));
+				break; // advance outer modelIndex
 			}
 			if (!isRetryableModelFailure(result.error) || modelIndex === modelsToTry.length - 1) break modelAttemptsLoop;
 			attemptNotes.push(formatModelAttemptNote(attempt, modelsToTry[modelIndex + 1]));
-			break;
+			break; // advance outer modelIndex to next fallback
 		}
 	}
 

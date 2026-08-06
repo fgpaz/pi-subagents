@@ -74,6 +74,11 @@ describe("model fallback helpers", () => {
 		assert.equal(isRetryableModelFailure("model load failed"), true);
 		assert.equal(isRetryableModelFailure("Stream ended without finish_reason"), true);
 		assert.equal(isRetryableModelFailure("Request timed out."), true);
+		// Bare Pi provider transport failures must trigger Luna/model fallback (nan down).
+		assert.equal(isRetryableModelFailure("Connection error."), true);
+		assert.equal(isRetryableModelFailure("Connection error"), true);
+		assert.equal(isRetryableModelFailure("fetch failed"), true);
+		assert.equal(isRetryableModelFailure("ECONNREFUSED 127.0.0.1:18765"), true);
 	});
 
 	it("does not treat ordinary task/tool failures as retryable model failures", () => {
