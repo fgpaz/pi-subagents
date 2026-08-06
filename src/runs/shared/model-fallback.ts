@@ -315,6 +315,10 @@ const RETRYABLE_MODEL_FAILURE_PATTERNS = [
 	/\b502\b/,
 	/\b503\b/,
 	/\b504\b/,
+	// mi-pi Nan local pool saturation (fail-fast → next model candidate)
+	/nan_pool_busy/i,
+	/nan_pool_timeout/i,
+	/nan_pool_unavailable/i,
 	/cold.?start/i,
 	/empty response/i,
 	/no output/i,

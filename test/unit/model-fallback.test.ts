@@ -79,6 +79,9 @@ describe("model fallback helpers", () => {
 		assert.equal(isRetryableModelFailure("Connection error"), true);
 		assert.equal(isRetryableModelFailure("fetch failed"), true);
 		assert.equal(isRetryableModelFailure("ECONNREFUSED 127.0.0.1:18765"), true);
+		assert.equal(isRetryableModelFailure("nan_pool_busy: 5/5 slots in use (fail-fast; try Luna/Grok overflow)"), true);
+		assert.equal(isRetryableModelFailure("nan_pool_timeout: could not acquire a slot within 400ms"), true);
+		assert.equal(isRetryableModelFailure("HTTP 429 nan_pool_unavailable"), true);
 	});
 
 	it("does not treat ordinary task/tool failures as retryable model failures", () => {
