@@ -115,6 +115,7 @@ import { acceptanceFailureMessage, aggregateAcceptanceReport, buildSkippedAccept
 import { attachContractProjections, isAgentContractV1 } from "../shared/agent-contract.ts";
 import { waitForImportedAsyncRoot } from "./chain-root-attachment.ts";
 import { appendRunnerStepsToStatus, consumeChainAppendRequests, countPendingChainAppendRequests, statusStepDescription } from "./chain-append.ts";
+import { injectRuntimeIdentitySystemPrompt } from "../shared/runtime-identity.ts";
 import { appendTurnBudgetSystemPrompt, formatTurnBudgetOutput, initialTurnBudgetState, turnBudgetDecision, turnBudgetDeferredNote, turnBudgetDeferredState, turnBudgetExceededMessage, turnBudgetSoftNote, turnBudgetState } from "../shared/turn-budget.ts";
 import { formatPartialDeliveryTurnBudgetMessage } from "../shared/writer-budget-policy.ts";
 import { initialToolBudgetState, toolBudgetState } from "../shared/tool-budget.ts";
@@ -1213,6 +1214,14 @@ async function runSingleStep(
 				childIndex: ctx.flatIndex,
 			})
 			: undefined;
+		const attemptSystemPrompt = injectRuntimeIdentitySystemPrompt(
+			appendTurnBudgetSystemPrompt(step.systemPrompt ?? "", ctx.turnBudget),
+			{
+				role: step.agent,
+				model: candidate,
+				thinking: resolveEffectiveThinking(candidate, step.thinking),
+			},
+		);
 		const { args, env, tempDir, toolDiagnosticPath, runtimeAcknowledgedExtensionsPath, capabilityAudit: attemptCapabilityAudit } = buildPiArgs({
 			parentSessionId: step.parentSessionId,
 			baseArgs: ["--mode", "json", "-p"],
@@ -1227,7 +1236,7 @@ async function runSingleStep(
 			tools: step.tools,
 			extensions: step.extensions,
 			subagentOnlyExtensions: step.subagentOnlyExtensions,
-			systemPrompt: appendTurnBudgetSystemPrompt(step.systemPrompt ?? "", ctx.turnBudget),
+			systemPrompt: attemptSystemPrompt,
 			systemPromptMode: step.systemPromptMode,
 			mcpDirectTools: step.mcpDirectTools,
 			capabilityCeiling: step.capabilityCeiling ?? ctx.capabilityCeiling,
@@ -1269,7 +1278,7 @@ async function runSingleStep(
 				...(candidate ? { model: candidate } : {}),
 				modelCandidates: candidates,
 				...(resolveEffectiveThinking(candidate, step.thinking) ? { thinking: resolveEffectiveThinking(candidate, step.thinking) } : {}),
-				systemPrompt: appendTurnBudgetSystemPrompt(step.systemPrompt ?? "", ctx.turnBudget),
+				systemPrompt: attemptSystemPrompt,
 				systemPromptMode: step.systemPromptMode,
 				inheritProjectContext: step.inheritProjectContext,
 				inheritSkills: step.inheritSkills,

@@ -88,6 +88,7 @@ import {
 } from "../shared/long-running-guard.ts";
 import { acceptanceFailureMessage, buildSkippedAcceptanceLedger, evaluateAcceptance, formatAcceptancePrompt, resolveEffectiveAcceptance, stripAcceptanceReport } from "../shared/acceptance.ts";
 import { attachContractProjections, isAgentContractV1 } from "../shared/agent-contract.ts";
+import { injectRuntimeIdentitySystemPrompt } from "../shared/runtime-identity.ts";
 import { appendTurnBudgetSystemPrompt, formatTurnBudgetOutput, initialTurnBudgetState, turnBudgetDecision, turnBudgetDeferredNote, turnBudgetDeferredState, turnBudgetExceededMessage, turnBudgetSoftNote, turnBudgetState } from "../shared/turn-budget.ts";
 import { formatPartialDeliveryTurnBudgetMessage } from "../shared/writer-budget-policy.ts";
 import { initialToolBudgetState, toolBudgetState } from "../shared/tool-budget.ts";
@@ -303,6 +304,14 @@ async function runSingleAttempt(
 			childIndex: options.index ?? 0,
 		})
 		: undefined;
+	const effectiveSystemPrompt = injectRuntimeIdentitySystemPrompt(
+		appendTurnBudgetSystemPrompt(shared.systemPrompt, options.turnBudget),
+		{
+			role: agent.name,
+			model: modelArg ?? model,
+			thinking: resolvedThinking,
+		},
+	);
 	const { args, env: sharedEnv, tempDir, toolDiagnosticPath, runtimeAcknowledgedExtensionsPath, capabilityAudit } = buildPiArgs({
 		baseArgs: ["--mode", "json", "-p"],
 		task,
@@ -318,7 +327,7 @@ async function runSingleAttempt(
 		tools: agent.tools,
 		extensions: agent.extensions,
 		subagentOnlyExtensions: agent.subagentOnlyExtensions,
-		systemPrompt: appendTurnBudgetSystemPrompt(shared.systemPrompt, options.turnBudget),
+		systemPrompt: effectiveSystemPrompt,
 		mcpDirectTools: agent.mcpDirectTools,
 		cwd: options.cwd ?? runtimeCwd,
 		promptFileStem: agent.name,
@@ -340,7 +349,6 @@ async function runSingleAttempt(
 		capabilityCeiling: options.capabilityCeiling,
 	});
 
-	const effectiveSystemPrompt = appendTurnBudgetSystemPrompt(shared.systemPrompt, options.turnBudget);
 	const toolPlan = resolvePiLaunchToolPlan({
 		tools: agent.tools,
 		extensions: agent.extensions,

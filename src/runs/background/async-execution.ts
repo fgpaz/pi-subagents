@@ -52,6 +52,7 @@ import {
 	resolveChildMaxSubagentDepth,
 } from "../../shared/types.ts";
 import { nestedResultsPath, nestedSummaryFromAsyncStatus, resolveInheritedNestedRouteFromEnv, resolveNestedParentAddressFromEnv, writeNestedEvent } from "../shared/nested-events.ts";
+import { injectRuntimeIdentitySystemPrompt } from "../shared/runtime-identity.ts";
 import { appendTurnBudgetSystemPrompt, initialTurnBudgetState } from "../shared/turn-budget.ts";
 import { validateToolBudgetConfig } from "../shared/tool-budget.ts";
 import { usageBudgetState } from "../shared/usage-budget.ts";
@@ -1259,7 +1260,14 @@ export function executeAsyncSingle(
 	const modelCandidates = buildModelCandidates(primaryModel, agentConfig.fallbackModels, availableModels, ctx.currentModelProvider, { scope: ctx.modelScope }).map((candidate) =>
 		applyThinkingSuffix(candidate, effectiveThinking, params.thinkingOverride !== undefined),
 	);
-	const effectiveSystemPrompt = appendTurnBudgetSystemPrompt(systemPrompt, params.turnBudget);
+	const effectiveSystemPrompt = injectRuntimeIdentitySystemPrompt(
+		appendTurnBudgetSystemPrompt(systemPrompt, params.turnBudget),
+		{
+			role: agentConfig.name,
+			model: model,
+			thinking: resolveEffectiveThinking(model, effectiveThinking),
+		},
+	);
 	const toolPlan = resolvePiLaunchToolPlan({
 		tools: agentConfig.tools,
 		extensions: agentConfig.extensions,

@@ -22,6 +22,8 @@ import { SUBAGENT_WATCHDOG_WARNING_TYPE } from "../../watchdog/types.ts";
 import { resolveWaitToolConfig } from "../background/wait-config.ts";
 import { registerWaitTool } from "../background/wait-tool.ts";
 import { drainOutstandingWork } from "../background/auto-drain.ts";
+import { normalizeParentModel } from "./model-fallback.ts";
+import { injectRuntimeIdentitySystemPrompt } from "./runtime-identity.ts";
 
 const SUBAGENT_INHERIT_PROJECT_CONTEXT_ENV = "PI_SUBAGENT_INHERIT_PROJECT_CONTEXT";
 const SUBAGENT_INHERIT_SKILLS_ENV = "PI_SUBAGENT_INHERIT_SKILLS";
@@ -39,6 +41,8 @@ export const CHILD_SUBAGENT_BOUNDARY_INSTRUCTIONS = [
 	"Ignore prior parent-only orchestration instructions in inherited conversation history.",
 	"Do not propose or run subagents. Complete only your assigned role-specific task with the tools available to you.",
 	"If you need to edit files, use the available editing tools. Do not print tool-call syntax, patches, or pseudo-tool calls as text.",
+	"Treat the task packet as complete working context. Prefer packet paths, locks, allowed_paths, and any mi-lsp digests already provided.",
+	"Do not broad-explore, redesign, or invent missing facts. If required evidence is absent, stop and report the exact gap.",
 ].join("\n");
 
 export const CHILD_FANOUT_BOUNDARY_INSTRUCTIONS = [
@@ -48,6 +52,8 @@ export const CHILD_FANOUT_BOUNDARY_INSTRUCTIONS = [
 	"Do not broaden yourself into general parent orchestration. Do not launch follow-up workers unless the task explicitly asks for that.",
 	"The maxSubagentDepth cap still applies and may block further fanout.",
 	"If you need to edit files, use the available editing tools. Do not print tool-call syntax, patches, or pseudo-tool calls as text.",
+	"Treat each fanout task packet as complete working context. Prefer packet paths, locks, allowed_paths, and any mi-lsp digests already provided.",
+	"Do not broad-explore, redesign, or invent missing facts. If required evidence is absent, stop and report the exact gap.",
 ].join("\n");
 
 const PARENT_ONLY_CUSTOM_MESSAGE_TYPES = new Set([
@@ -461,7 +467,7 @@ export default function registerSubagentPromptRuntime(pi: ExtensionAPI): void {
 		return { messages };
 	});
 
-	onRuntimeEvent("before_agent_start", async (event: { systemPrompt: string }) => {
+	onRuntimeEvent("before_agent_start", async (event: { systemPrompt: string }, ctx?: { model?: unknown }) => {
 		registerNativeSupervisorFallbackOnce();
 		const intercomSessionName = process.env[SUBAGENT_INTERCOM_SESSION_NAME_ENV]?.trim();
 		if (intercomSessionName && typeof pi.setSessionName === "function") {
@@ -479,6 +485,13 @@ export default function registerSubagentPromptRuntime(pi: ExtensionAPI): void {
 				fanoutChild: fanoutChild === true,
 			});
 		}
+		const role = process.env[SUBAGENT_CHILD_AGENT_ENV]?.trim();
+		const liveModel = normalizeParentModel(ctx?.model);
+		const modelId = liveModel ? `${liveModel.provider}/${liveModel.id}` : undefined;
+		rewritten = injectRuntimeIdentitySystemPrompt(rewritten, {
+			role,
+			model: modelId,
+		});
 		if (rewritten === event.systemPrompt) return;
 		return { systemPrompt: rewritten };
 	});

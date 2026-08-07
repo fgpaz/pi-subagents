@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- **Runtime identity for children**: inject authoritative `role` / `model` / `thinking` into child system prompts at launch (and reinforce via `before_agent_start`) so leaves quote real model ids instead of inventing them from inherited parent prose.
+- **Packet-first child boundary**: child/fanout boundaries require treating the task packet as complete context (allowed paths, locks, mi-lsp digests) and stopping on gaps instead of broad-exploring or redesigning.
 - **Enforce writer budget policy at launch**: strip `turnBudget` and hard `toolBudget` from mutation-capable single/parallel/chain children (workers, writers, implementation tasks). Read-only scouts/reviewers keep count caps. Prefer `timeoutMs` + narrow task scope + checkpoints for long writers. Turn-budget aborts after observed file mutations now include `partial_delivery` resume guidance.
 
 ## [Unreleased]
