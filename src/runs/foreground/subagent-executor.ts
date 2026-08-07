@@ -24,6 +24,7 @@ import { runSync } from "./execution.ts";
 import { handleWatchdogToolAction, WATCHDOG_TOOL_ACTIONS } from "../../watchdog/tool-actions.ts";
 import type { MainWatchdogRuntime } from "../../watchdog/runtime.ts";
 import { buildModelCandidates, normalizeParentModel, resolveEffectiveSubagentModel, resolveModelCandidate, type ParentModel } from "../shared/model-fallback.ts";
+import { stampModelCandidateChain, BARE_FALLBACK_THINKING } from "../shared/pi-args.ts";
 import type { ModelScopeConfig } from "../shared/model-scope.ts";
 import { aggregateParallelOutputs } from "../shared/parallel-utils.ts";
 import { recordRun } from "../shared/run-history.ts";
@@ -4254,10 +4255,15 @@ export function createSubagentExecutor(deps: ExecutorDeps): {
 					forkAvailableModels,
 					parentModel?.provider,
 				);
+				const stamped = stampModelCandidateChain(
+					candidates,
+					agentConfig?.thinking,
+					{ fallbackModels: agentConfig?.fallbackModels, bareFallbackThinking: BARE_FALLBACK_THINKING },
+				);
 				forkThinkingRequirements.set(
 					index,
-					candidates.length === 0
-						|| candidates.some((candidate) => forkedChildRequiresThinkingOff(candidate, forkAvailableModels, parentModel?.provider)),
+					stamped.length === 0
+						|| stamped.some((candidate) => forkedChildRequiresThinkingOff(candidate, forkAvailableModels, parentModel?.provider)),
 				);
 			};
 			const forkContextResolver = createForkContextResolver(ctx.sessionManager, contextPolicy.usesFork ? "fork" : undefined, {

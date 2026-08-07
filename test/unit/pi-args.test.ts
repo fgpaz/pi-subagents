@@ -29,6 +29,9 @@ import {
 	buildPiArgs,
 	projectLaunchResolvedChildExtensions,
 	resolvePiLaunchToolPlan,
+	stampModelCandidateThinking,
+	stampModelCandidateChain,
+	BARE_FALLBACK_THINKING,
 } from "../../src/runs/shared/pi-args.ts";
 
 const originalEnv = {
@@ -1130,4 +1133,143 @@ describe("buildPiArgs system prompt mode wiring", () => {
 
 		assert.ok(args.includes("--system-prompt"));
 	});
+});
+
+// ── stampModelCandidateThinking / stampModelCandidateChain ────────────────────────
+
+describe("stampModelCandidateThinking – primary thinking leak prevention", () => {
+
+	it("primary nan/qwen:max with thinking max stays :max", () => {
+		const result = stampModelCandidateThinking("nan/qwen3.6:max", "max", {
+			candidateIndex: 0,
+			fallbackModels: [],
+		});
+		assert.equal(result, "nan/qwen3.6:max");
+	});
+
+	it("bare primary xai/grok-4.5 + thinking max + fallbackModels includes grok:low → :low", () => {
+		const result = stampModelCandidateThinking("xai/grok-4.5", "max", {
+			candidateIndex: 0,
+			fallbackModels: ["xai/grok-4.5:low", "openai-codex/gpt-5.6-luna:high"],
+		});
+		assert.equal(result, "xai/grok-4.5:low");
+	});
+
+	it("bare primary xai/grok-4.5 + thinking max without matching fallback → :max (primary applied)", () => {
+		const result = stampModelCandidateThinking("xai/grok-4.5", "max", {
+			candidateIndex: 0,
+			fallbackModels: ["openai-codex/gpt-5.6-luna:high"],
+		});
+		assert.equal(result, "xai/grok-4.5:max");
+	});
+
+	it("fallback candidate index 1 bare model → :low not primary thinking", () => {
+		const result = stampModelCandidateThinking("xai/grok-4.5", "max", {
+			candidateIndex: 1,
+			fallbackModels: [],
+		});
+		assert.equal(result, "xai/grok-4.5:low");
+	});
+
+	it("fallback xai/grok-4.5:low + candidateIndex 1 → :low preserved (never :max)", () => {
+		const result = stampModelCandidateThinking("xai/grok-4.5:low", "max", {
+			candidateIndex: 1,
+			fallbackModels: [],
+		});
+		assert.equal(result, "xai/grok-4.5:low");
+	});
+
+	it("replaceExisting=true still forces override thinking onto suffixed model", () => {
+		const result = stampModelCandidateThinking("xai/grok-4.5:low", "max", {
+			replaceExisting: true,
+			candidateIndex: 0,
+		});
+		assert.equal(result, "xai/grok-4.5:max");
+	});
+
+	it("luna:high preserved when primary thinking is max and replaceExisting false", () => {
+		const result = stampModelCandidateThinking("openai-codex/gpt-5.6-luna:high", "max", {
+			candidateIndex: 1,
+			fallbackModels: [],
+		});
+		assert.equal(result, "openai-codex/gpt-5.6-luna:high");
+	});
+
+	it("undefined model returns undefined", () => {
+		assert.equal(stampModelCandidateThinking(undefined, "max", { candidateIndex: 0 }), undefined);
+	});
+
+	it("bare fallback with unqualified base match (grok-4.5 vs xai/grok-4.5:low) → :low", () => {
+		const result = stampModelCandidateThinking("grok-4.5", "max", {
+			candidateIndex: 0,
+			fallbackModels: ["xai/grok-4.5:low"],
+		});
+		assert.equal(result, "grok-4.5:low");
+	});
+
+	it("BARE_FALLBACK_THINKING constant equals low", () => {
+		assert.equal(BARE_FALLBACK_THINKING, "low");
+	});
+
+});
+
+describe("stampModelCandidateChain", () => {
+
+	it("chain: primary thinking max + candidates [nan:max, luna:high, grok:low] → grok stays :low", () => {
+		const chain = stampModelCandidateChain(
+			["nan/qwen3.6:max", "openai-codex/gpt-5.6-luna:high", "xai/grok-4.5:low"],
+			"max",
+			{ fallbackModels: [], bareFallbackThinking: BARE_FALLBACK_THINKING },
+		);
+		assert.deepEqual(chain, [
+			"nan/qwen3.6:max",
+			"openai-codex/gpt-5.6-luna:high",
+			"xai/grok-4.5:low",
+		]);
+	});
+
+	it("chain: bare fallbacks with primary thinking max all become :low", () => {
+		const chain = stampModelCandidateChain(
+			["nan/qwen3.6:max", "xai/grok-4.5", "openai/gpt-5.6"],
+			"max",
+			{ fallbackModels: [], bareFallbackThinking: BARE_FALLBACK_THINKING },
+		);
+		assert.deepEqual(chain, [
+			"nan/qwen3.6:max",
+			"xai/grok-4.5:low",
+			"openai/gpt-5.6:low",
+		]);
+	});
+
+	it("chain: bare primary adopts suffix from fallbackModels", () => {
+		const chain = stampModelCandidateChain(
+			["xai/grok-4.5", "openai/gpt-5.6"],
+			"max",
+			{
+				fallbackModels: ["xai/grok-4.5:low", "openai-codex/gpt-5.6-luna:high"],
+				bareFallbackThinking: BARE_FALLBACK_THINKING,
+			},
+		);
+		assert.deepEqual(chain, [
+			"xai/grok-4.5:low",
+			"openai/gpt-5.6:low",
+		]);
+	});
+
+	it("chain: replaceExisting forces override thinking on all candidates", () => {
+		const chain = stampModelCandidateChain(
+			["xai/grok-4.5:low", "nan/qwen3.6:max"],
+			"high",
+			{ replaceExisting: true, fallbackModels: [] },
+		);
+		assert.deepEqual(chain, [
+			"xai/grok-4.5:high",
+			"nan/qwen3.6:high",
+		]);
+	});
+
+	it("chain: empty array returns empty", () => {
+		assert.deepEqual(stampModelCandidateChain([], "max", {}), []);
+	});
+
 });

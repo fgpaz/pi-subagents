@@ -9,7 +9,7 @@ import { resolvePiPackageRoot } from "./pi-spawn.ts";
 import { RUNTIME_EXTENSION_ACK_PATH_ENV } from "./runtime-acknowledged-extensions.ts";
 import { STRUCTURED_OUTPUT_CAPTURE_ENV, STRUCTURED_OUTPUT_SCHEMA_ENV } from "./structured-output.ts";
 import { TEMP_ROOT_DIR, type JsonSchemaObject, type LaunchResolvedChildExtensionsV1, type ResolvedToolBudget } from "../../shared/types.ts";
-import { THINKING_LEVELS } from "../../shared/model-info.ts";
+import { splitKnownThinkingSuffix, THINKING_LEVELS } from "../../shared/model-info.ts";
 import { TOOL_BUDGET_ENV, TOOL_BUDGET_ZERO_AUTH_ENV, encodeToolBudgetEnv } from "./tool-budget.ts";
 import { CHILD_TOOL_DIAGNOSTIC_PATH_ENV, MCP_DIRECT_CHILD_TOOLS_ENV, REQUIRED_CHILD_TOOLS_ENV } from "./tool-availability.ts";
 import { CHILD_WATCHDOG_CONFIG_ENV, encodeChildWatchdogConfig, type ChildWatchdogConfig } from "../../watchdog/child-status.ts";
@@ -116,6 +116,112 @@ export function applyThinkingSuffix(model: string | undefined, thinking: string 
 		return replaceExisting ? `${model.slice(0, colonIdx)}:${thinking}` : model;
 	}
 	return `${model}:${thinking}`;
+}
+
+/** Default thinking level for bare/fallback model candidates that have no embedded suffix. */
+export const BARE_FALLBACK_THINKING = "low" as const;
+
+/**
+ * Stamp thinking onto one chain candidate.
+ *
+ * Rules:
+ * 1. `replaceExisting=true` — force `primaryThinking` onto model (explicit override).
+ * 2. Model already has a known thinking suffix → keep it (unless `replaceExisting`).
+ * 3. `candidateIndex>0` (fallback/secondary) → use `bareFallbackThinking` (default "low"), NEVER
+ *    the primary role thinking. This prevents `thinking:max` leaking onto overflow models like
+ *    `xai/grok-4.5`.
+ * 4. Primary bare (`candidateIndex===0`) → look up embedded suffix from `fallbackModels` list.
+ *    If a fallback entry shares the same base model with a suffix, adopt that suffix so that
+ *    bare `xai/grok-4.5` becomes `xai/grok-4.5:low` when the fallback array contains
+ *    `xai/grok-4.5:low`. Otherwise fall through to primaryThinking.
+ */
+export function stampModelCandidateThinking(
+	model: string | undefined,
+	primaryThinking: string | false | undefined,
+	options?: {
+		replaceExisting?: boolean;
+		fallbackModels?: string[];
+		candidateIndex?: number;
+		bareFallbackThinking?: string | false;
+	},
+): string | undefined {
+	if (!model) return model;
+
+	const replaceExisting = Boolean(options?.replaceExisting);
+	const candidateIndex = options?.candidateIndex ?? 0;
+	const fallbackModels = options?.fallbackModels;
+	const bareFallbackThinking = options?.bareFallbackThinking ?? BARE_FALLBACK_THINKING;
+
+	// ── Rule 1: explicit override ──────────────────────────────────────
+	if (replaceExisting) {
+		return applyThinkingSuffix(model, primaryThinking, true);
+	}
+
+	// ── Rule 2: model already carries a known suffix ──────────────────
+	const { thinkingSuffix } = splitKnownThinkingSuffix(model);
+	if (thinkingSuffix) {
+		return model; // keep existing suffix
+	}
+
+	// ── Rule 3: fallback/secondary candidate → bare default, NEVER primary ──
+	if (candidateIndex > 0) {
+		return applyThinkingSuffix(model, bareFallbackThinking);
+	}
+
+	// ── Rule 4: primary bare → adopt embedded suffix from fallbackModels ──
+	if (fallbackModels?.length) {
+		const { baseModel } = splitKnownThinkingSuffix(model);
+		// Find first fallback entry whose base matches and has a suffix
+		for (const entry of fallbackModels) {
+			if (typeof entry !== "string" || !entry) continue;
+			const { baseModel: eBase, thinkingSuffix: eSuffix } = splitKnownThinkingSuffix(entry);
+			if (eSuffix === "") continue; // skip entries without suffix
+			// Normalize both bases for comparison (strip provider prefix for exact match, or allow unqualified match)
+			if (eBase === baseModel || eBase === model) {
+				return applyThinkingSuffix(model, eSuffix.slice(1));
+			}
+			// Unqualified model matches provider-qualified fallback: "grok-4.5" ↔ "xai/grok-4.5:low"
+			if (!baseModel.includes("/") && eBase.includes("/")) {
+				const fallbackIdOnly = eBase.slice(eBase.lastIndexOf("/") + 1);
+				if (baseModel === fallbackIdOnly) {
+					return applyThinkingSuffix(model, eSuffix.slice(1));
+				}
+			}
+			// Qualified model matches unqualified fallback: "xai/grok-4.5" ↔ "grok-4.5:low"
+			if (baseModel.includes("/") && !eBase.includes("/")) {
+				const modelIdOnly = baseModel.slice(baseModel.lastIndexOf("/") + 1);
+				if (modelIdOnly === eBase) {
+					return applyThinkingSuffix(model, eSuffix.slice(1));
+				}
+			}
+		}
+	}
+
+	// ── Fallback: apply primaryThinking via existing helper ────────────
+	return applyThinkingSuffix(model, primaryThinking);
+}
+
+/**
+ * Stamp thinking onto every model candidate in a chain.
+ */
+export function stampModelCandidateChain(
+	candidates: string[],
+	primaryThinking: string | false | undefined,
+	options?: {
+		replaceExisting?: boolean;
+		fallbackModels?: string[];
+		bareFallbackThinking?: string | false;
+	},
+): string[] {
+	const { replaceExisting, fallbackModels, bareFallbackThinking } = options ?? {};
+	return candidates.map((candidate, idx) =>
+		stampModelCandidateThinking(candidate, primaryThinking, {
+			replaceExisting,
+			fallbackModels,
+			candidateIndex: idx,
+			bareFallbackThinking,
+		}),
+	);
 }
 
 export interface ResolvePiLaunchToolPlanInput {

@@ -55,7 +55,7 @@ import { evaluateCompletionMutationGuard } from "../shared/completion-guard.ts";
 import { getPiSpawnCommand } from "../shared/pi-spawn.ts";
 import { createJsonlWriter } from "../../shared/jsonl-writer.ts";
 import { attachPostExitStdioGuard, trySignalChild } from "../../shared/post-exit-stdio-guard.ts";
-import { applyThinkingSuffix, buildPiArgs, cleanupTempDir, projectLaunchResolvedChildExtensions, resolvePiLaunchToolPlan } from "../shared/pi-args.ts";
+import { applyThinkingSuffix, buildPiArgs, cleanupTempDir, projectLaunchResolvedChildExtensions, resolvePiLaunchToolPlan, stampModelCandidateThinking, stampModelCandidateChain, BARE_FALLBACK_THINKING } from "../shared/pi-args.ts";
 import { readRuntimeAcknowledgedExtensions } from "../shared/runtime-acknowledged-extensions.ts";
 import { assertAgentAllowedByCapabilityCeiling, decodeSubagentCapabilityCeiling, intersectSubagentCapabilityCeilings, resolveCurrentSubagentCapabilityCeiling, SUBAGENT_CAPABILITY_CEILING_ENV } from "../shared/capability-ceiling.ts";
 import { resolveEffectiveThinking } from "../../shared/model-info.ts";
@@ -293,7 +293,11 @@ async function runSingleAttempt(
 	},
 ): Promise<SingleResult> {
 	const effectiveThinking = options.thinkingOverride ?? agent.thinking;
-	const modelArg = applyThinkingSuffix(model, effectiveThinking, options.thinkingOverride !== undefined);
+	const modelArg = stampModelCandidateThinking(model, effectiveThinking, {
+		replaceExisting: options.thinkingOverride !== undefined,
+		fallbackModels: agent.fallbackModels,
+		candidateIndex: 0,
+	});
 	const resolvedThinking = resolveEffectiveThinking(modelArg, effectiveThinking);
 	const watchdogConfig = resolveWatchdogConfig(options.cwd ?? runtimeCwd);
 	const childWatchdog = watchdogConfig.ok
@@ -1515,9 +1519,11 @@ async function runSyncCompletion(
 				artifactPaths: artifactPathsResult,
 				transcriptWriter,
 				attemptNotes,
-				modelCandidates: candidates
-					.map((modelCandidate) => applyThinkingSuffix(modelCandidate, options.thinkingOverride ?? agent.thinking, options.thinkingOverride !== undefined))
-					.filter((modelCandidate): modelCandidate is string => Boolean(modelCandidate)),
+				modelCandidates: stampModelCandidateChain(
+					candidates,
+					options.thinkingOverride ?? agent.thinking,
+					{ replaceExisting: options.thinkingOverride !== undefined, fallbackModels: agent.fallbackModels, bareFallbackThinking: BARE_FALLBACK_THINKING },
+				).filter((modelCandidate): modelCandidate is string => Boolean(modelCandidate)),
 				outputSnapshot,
 				originalTask: task,
 			});

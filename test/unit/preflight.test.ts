@@ -117,7 +117,7 @@ Project prompt.
 			assert.match(result.contract.launchContractDigest, /^[a-f0-9]{64}$/);
 			assert.ok(result.contract.agent.shadowedCandidates.some((candidate) => candidate.name === "worker" && candidate.source === "builtin"));
 			assert.equal(result.contract.model, "test/primary:high");
-			assert.deepEqual(result.contract.modelCandidates, ["test/primary:high", "test/fallback:high"]);
+			assert.deepEqual(result.contract.modelCandidates, ["test/primary:high", "test/fallback:low"]);
 			assert.equal(result.contract.thinking, "high");
 			assert.deepEqual(result.contract.skills.requested, ["project-skill"]);
 			assert.equal(result.contract.skills.resolved[0]?.name, "project-skill");

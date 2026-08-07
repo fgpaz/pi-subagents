@@ -7,7 +7,7 @@ import { resolveExecutionAgentScope } from "../agents/agent-scope.ts";
 import { buildSkillInjection, normalizeSkillInput, resolveSkillsWithFallback } from "../agents/skills.ts";
 import { buildAgentMemoryInjection } from "../agents/agent-memory.ts";
 import { buildModelCandidates, resolveEffectiveSubagentModel, type AvailableModelInfo, type ParentModel } from "../runs/shared/model-fallback.ts";
-import { applyThinkingSuffix, resolvePiLaunchToolPlan, type PiLaunchToolPlan } from "../runs/shared/pi-args.ts";
+import { applyThinkingSuffix, resolvePiLaunchToolPlan, type PiLaunchToolPlan, stampModelCandidateThinking, stampModelCandidateChain, BARE_FALLBACK_THINKING } from "../runs/shared/pi-args.ts";
 import { injectOutputPathSystemPrompt, normalizeSingleOutputOverride, resolveSingleOutputPath } from "../runs/shared/single-output.ts";
 import { getArtifactPaths, getArtifactsDir } from "../shared/artifacts.ts";
 import { resolveEffectiveThinking } from "../shared/model-info.ts";
@@ -263,9 +263,16 @@ export async function resolveSubagentLaunchContract(input: SubagentLaunchContrac
 	const preferredProvider = input.preferredProvider ?? input.parentModel?.provider;
 	const primaryModel = resolveEffectiveSubagentModel(input.model, agent.model, input.parentModel, availableModels, preferredProvider, { scope: discovered.modelScope });
 	const effectiveThinkingConfig = input.thinking !== undefined ? input.thinking : agent.thinking;
-	const model = applyThinkingSuffix(primaryModel, effectiveThinkingConfig, input.thinking !== undefined);
-	const modelCandidates = buildModelCandidates(primaryModel, agent.fallbackModels, availableModels, preferredProvider, { scope: discovered.modelScope })
-		.map((candidate) => applyThinkingSuffix(candidate, effectiveThinkingConfig, input.thinking !== undefined) ?? candidate);
+	const model = stampModelCandidateThinking(primaryModel, effectiveThinkingConfig, {
+		replaceExisting: input.thinking !== undefined,
+		fallbackModels: agent.fallbackModels,
+		candidateIndex: 0,
+	});
+	const modelCandidates = stampModelCandidateChain(
+		buildModelCandidates(primaryModel, agent.fallbackModels, availableModels, preferredProvider, { scope: discovered.modelScope }),
+		effectiveThinkingConfig,
+		{ replaceExisting: input.thinking !== undefined, fallbackModels: agent.fallbackModels, bareFallbackThinking: BARE_FALLBACK_THINKING },
+	);
 	let toolPlan: PiLaunchToolPlan;
 	try {
 		toolPlan = resolvePiLaunchToolPlan({

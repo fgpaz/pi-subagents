@@ -12,7 +12,7 @@ import { createRequire } from "node:module";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import type { AgentConfig } from "../../agents/agents.ts";
 import { writePrivateAtomicJson } from "../../shared/atomic-json.ts";
-import { applyThinkingSuffix, projectLaunchResolvedChildExtensions, resolvePiLaunchToolPlan } from "../shared/pi-args.ts";
+import { applyThinkingSuffix, projectLaunchResolvedChildExtensions, resolvePiLaunchToolPlan, stampModelCandidateThinking, stampModelCandidateChain, BARE_FALLBACK_THINKING } from "../shared/pi-args.ts";
 import { injectOutputPathSystemPrompt, injectSingleOutputInstruction, normalizeSingleOutputOverride, resolveSingleOutputPath, validateFileOnlyOutputMode } from "../shared/single-output.ts";
 import { buildChainInstructions, isCheckpointStep, isDynamicParallelStep, isParallelStep, resolveStepBehavior, suppressProgressForReadOnlyTask, writeInitialProgressFile, type ChainStep, type ResolvedStepBehavior, type SequentialStep, type StepOverrides } from "../../shared/settings.ts";
 import type { RunnerStep } from "../shared/parallel-utils.ts";
@@ -707,7 +707,11 @@ export function buildAsyncRunnerSteps(id: string, params: AsyncRunnerStepBuildPa
 		);
 		const thinkingOverride = flatIndex === undefined ? undefined : thinkingOverridesByFlatIndex?.[flatIndex];
 		const effectiveThinking = thinkingOverride ?? a.thinking;
-		const model = applyThinkingSuffix(primaryModel, effectiveThinking, thinkingOverride !== undefined);
+		const model = stampModelCandidateThinking(primaryModel, effectiveThinking, {
+			replaceExisting: thinkingOverride !== undefined,
+			fallbackModels: a.fallbackModels,
+			candidateIndex: 0,
+		});
 		const agentContract = s.agentContract ?? params.agentContract;
 		const toolPlan = resolvePiLaunchToolPlan({
 			tools: a.tools,
@@ -737,8 +741,10 @@ export function buildAsyncRunnerSteps(id: string, params: AsyncRunnerStepBuildPa
 			model,
 			thinking: resolveEffectiveThinking(model, effectiveThinking),
 			launchResolvedExtensions,
-			modelCandidates: buildModelCandidates(primaryModel, a.fallbackModels, availableModels, ctx.currentModelProvider, { scope: ctx.modelScope }).map((candidate) =>
-				applyThinkingSuffix(candidate, effectiveThinking, thinkingOverride !== undefined),
+			modelCandidates: stampModelCandidateChain(
+				buildModelCandidates(primaryModel, a.fallbackModels, availableModels, ctx.currentModelProvider, { scope: ctx.modelScope }),
+				effectiveThinking,
+				{ replaceExisting: thinkingOverride !== undefined, fallbackModels: a.fallbackModels, bareFallbackThinking: BARE_FALLBACK_THINKING },
 			),
 			tools: a.tools,
 			extensions: a.extensions,
@@ -1242,7 +1248,11 @@ export function executeAsyncSingle(
 		ctx.currentModelProvider,
 	);
 	const effectiveThinking = params.thinkingOverride ?? agentConfig.thinking;
-	const model = applyThinkingSuffix(primaryModel, effectiveThinking, params.thinkingOverride !== undefined);
+	const model = stampModelCandidateThinking(primaryModel, effectiveThinking, {
+		replaceExisting: params.thinkingOverride !== undefined,
+		fallbackModels: agentConfig.fallbackModels,
+		candidateIndex: 0,
+	});
 	const toolBudgetInput = params.toolBudget ?? agentConfig.toolBudget ?? params.configToolBudget;
 	const resolvedToolBudget = validateToolBudgetConfig(toolBudgetInput, params.toolBudget ? "toolBudget" : agentConfig.toolBudget ? "agent.toolBudget" : "config.toolBudget");
 	if (resolvedToolBudget.error) return formatAsyncStartError("single", resolvedToolBudget.error);
@@ -1257,8 +1267,10 @@ export function executeAsyncSingle(
 	const structuredOutput = params.structuredOutputSchema
 		? createStructuredOutputRuntime(params.structuredOutputSchema, path.join(asyncDir, "structured-output"))
 		: undefined;
-	const modelCandidates = buildModelCandidates(primaryModel, agentConfig.fallbackModels, availableModels, ctx.currentModelProvider, { scope: ctx.modelScope }).map((candidate) =>
-		applyThinkingSuffix(candidate, effectiveThinking, params.thinkingOverride !== undefined),
+	const modelCandidates = stampModelCandidateChain(
+		buildModelCandidates(primaryModel, agentConfig.fallbackModels, availableModels, ctx.currentModelProvider, { scope: ctx.modelScope }),
+		effectiveThinking,
+		{ replaceExisting: params.thinkingOverride !== undefined, fallbackModels: agentConfig.fallbackModels, bareFallbackThinking: BARE_FALLBACK_THINKING },
 	);
 	const effectiveSystemPrompt = injectRuntimeIdentitySystemPrompt(
 		appendTurnBudgetSystemPrompt(systemPrompt, params.turnBudget),
