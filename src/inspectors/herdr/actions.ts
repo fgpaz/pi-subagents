@@ -10,7 +10,10 @@ import { writeAtomicJson } from "../../shared/atomic-json.ts";
 import { DIRS, type Details, type SubagentState } from "../../shared/types.ts";
 import { readStatus } from "../../shared/utils.ts";
 import { resolveSubagentRunId } from "../../runs/background/run-id-resolver.ts";
+import { resolveNodeExecutable } from "../../shared/node-executable.ts";
 import { createHerdrClient, detectHerdr, type HerdrClient, type HerdrErrorCode, type HerdrResult } from "./client.ts";
+import { encodeSessionRoots } from "./session-roots-codec.ts";
+import { formatShellCommand } from "./shell-command.ts";
 
 export const HERDR_INSPECTOR_ACTIONS = ["inspector.open", "inspector.status", "inspector.close"] as const;
 export type HerdrInspectorAction = typeof HERDR_INSPECTOR_ACTIONS[number];
@@ -45,6 +48,7 @@ interface InspectorDeps {
 	client?: HerdrClient;
 	missions?: MissionStoreConfig;
 	authorityPolicy?: AuthorityPolicyConfig;
+	sessionRoots?: string[];
 	cwd: string;
 	signal?: AbortSignal;
 	now?: () => Date;
@@ -84,16 +88,11 @@ function extractPaneId(value: unknown): string | undefined {
 	return undefined;
 }
 
-function shellQuote(value: string): string {
-	if (process.platform === "win32") return `"${value.replaceAll('"', '\\"')}"`;
-	return `'${value.replaceAll("'", "'\\''")}'`;
-}
-
-function inspectorCommand(input: { runnerPath: string; asyncDir: string; runId: string; index?: number; missionPath?: string; allowSteer: boolean; allowStop: boolean }): string {
-	const args = [process.execPath, "--experimental-strip-types", input.runnerPath, "--async-dir", input.asyncDir, "--run-id", input.runId, "--allow-steer", String(input.allowSteer), "--allow-stop", String(input.allowStop)];
+function inspectorCommand(input: { runnerPath: string; asyncDir: string; runId: string; index?: number; missionPath?: string; allowSteer: boolean; allowStop: boolean; sessionRoots: string[] }): string {
+	const args = [input.runnerPath, "--async-dir", input.asyncDir, "--run-id", input.runId, "--allow-steer", String(input.allowSteer), "--allow-stop", String(input.allowStop), "--session-roots", encodeSessionRoots(input.sessionRoots)];
 	if (input.index !== undefined) args.push("--index", String(input.index));
 	if (input.missionPath) args.push("--mission-path", input.missionPath);
-	return args.map(shellQuote).join(" ");
+	return formatShellCommand(resolveNodeExecutable(), args);
 }
 
 function missionForRun(asyncDir: string, cwd: string, config: MissionStoreConfig | undefined, runId: string): { id: string; path: string } | undefined {
@@ -112,6 +111,12 @@ function pathWithin(base: string, candidate: string): boolean {
 	const resolvedBase = path.resolve(base);
 	const resolvedCandidate = path.resolve(candidate);
 	return resolvedCandidate === resolvedBase || resolvedCandidate.startsWith(`${resolvedBase}${path.sep}`);
+}
+
+function herdrSessionRoots(target: { runId: string }, deps: InspectorDeps): string[] {
+	const roots = deps.sessionRoots ?? deps.state?.trustedSessionRoots ?? [];
+	const job = deps.state?.asyncJobs.get(target.runId) ?? deps.state?.fleetJobs?.get(target.runId);
+	return [...new Set([...roots, ...(job?.sessionRoot ? [job.sessionRoot] : [])])];
 }
 
 function isTrustedAsyncDir(asyncDir: string, deps: InspectorDeps): boolean {
@@ -189,13 +194,13 @@ export async function handleHerdrInspectorAction(action: HerdrInspectorAction, p
 		if (live.ok) return result(`Herdr inspector pane ${existing.paneId} is already open for async run ${target.runId}.${params.focus ? " Herdr cannot refocus an arbitrary raw pane id; select it in the Herdr UI." : ""}`);
 	}
 	const splitArgs = ["pane", "split", "--current", "--direction", "right", "--cwd", status.cwd ?? deps.cwd];
-	if (params.focus !== false) splitArgs.push("--focus");
+	splitArgs.push(params.focus === true ? "--focus" : "--no-focus");
 	const split = await client.run(splitArgs, { timeoutMs: 15_000, signal: deps.signal });
 	if (split.ok === false) return result(formatHerdrError(split.error), true);
 	const paneId = extractPaneId(split.data);
 	if (!paneId) return result("Herdr inspector error (PANE_GONE): pane split returned no pane id.", true);
 	const mission = missionForRun(target.asyncDir, deps.cwd, deps.missions, target.runId);
-	const runnerPath = deps.runnerPath ?? fileURLToPath(new URL("./inspector-runner.ts", import.meta.url));
+	const runnerPath = deps.runnerPath ?? fileURLToPath(new URL("../../../inspector-runner.mjs", import.meta.url));
 	const command = inspectorCommand({
 		runnerPath,
 		asyncDir: target.asyncDir,
@@ -204,6 +209,7 @@ export async function handleHerdrInspectorAction(action: HerdrInspectorAction, p
 		missionPath: mission?.path,
 		allowSteer: resolveAuthorityDecision({ action: "steerRun", policy: deps.authorityPolicy }) === "auto",
 		allowStop: resolveAuthorityDecision({ action: "stopRun", policy: deps.authorityPolicy }) === "auto",
+		sessionRoots: herdrSessionRoots(target, deps),
 	});
 	const started = await client.run(["pane", "run", paneId, command], { timeoutMs: 15_000, signal: deps.signal });
 	if (started.ok === false) {
@@ -220,7 +226,7 @@ export async function handleHerdrInspectorAction(action: HerdrInspectorAction, p
 		...(mission ? { missionId: mission.id, missionPath: mission.path } : {}),
 		paneId,
 		openedAt: now,
-		...(params.focus !== false ? { lastFocusedAt: now } : {}),
+		...(params.focus === true ? { lastFocusedAt: now } : {}),
 		herdrVersion: detected.data.versionText,
 		command,
 	};

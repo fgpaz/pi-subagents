@@ -4,6 +4,7 @@ import {
 	checkModelScope,
 	matchesScopePattern,
 	parseModelScopeConfig,
+	resolveModelScopesForAgent,
 	type ModelScopeConfig,
 } from "../../src/runs/shared/model-scope.ts";
 
@@ -73,12 +74,18 @@ describe("checkModelScope", () => {
 		assert.equal(violation?.severity, "error");
 		assert.equal(violation?.model, "deepseek/deepseek-v4");
 		assert.deepEqual(violation?.allowedPatterns, ["anthropic/*", "openai/gpt-5-*"]);
+		assert.equal(violation?.origin, "modelScope");
 		assert.match(violation?.message ?? "", /outside the configured subagent model scope/);
 	});
 
 	it("returns a warn violation for an inherited out-of-scope model", () => {
 		const violation = checkModelScope("deepseek/deepseek-v4", scope, "inherited");
 		assert.equal(violation?.severity, "warn");
+	});
+
+	it("returns an error violation for an inherited model in strict mode", () => {
+		const violation = checkModelScope("deepseek/deepseek-v4", { ...scope, strict: true }, "inherited");
+		assert.equal(violation?.severity, "error");
 	});
 
 	it("defaults to inherited (warn) severity when source is omitted-ish via inherited", () => {
@@ -96,6 +103,34 @@ describe("checkModelScope", () => {
 	});
 });
 
+describe("resolveModelScopesForAgent", () => {
+	it("returns independent global and agent checks with inherited flags", () => {
+		assert.deepEqual(
+			resolveModelScopesForAgent({ enforce: true, strict: true, allow: ["openai/*"], agents: { worker: { allow: ["openai/gpt-5-mini"] } } }, "worker", { provider: "openai", id: "gpt-5" }),
+			[
+				{ enforce: true, strict: true, allow: ["openai/*"], origin: "modelScope" },
+				{ enforce: true, strict: true, allow: ["openai/gpt-5-mini"], origin: "modelScope.agents.worker" },
+			],
+		);
+	});
+
+	it("expands inherit against the current parent model", () => {
+		const scopes = resolveModelScopesForAgent({ enforce: true, allow: ["inherit"], agents: { reviewer: { allow: ["inherit"] } } }, "reviewer", { provider: "anthropic", id: "claude-sonnet-4" });
+		assert.deepEqual(scopes.map((scope) => scope.allow), [["anthropic/claude-sonnet-4"], ["anthropic/claude-sonnet-4"]]);
+	});
+
+	it("keeps inherit literal when no parent model is available so enforcement fails closed", () => {
+		const [scope] = resolveModelScopesForAgent({ enforce: true, allow: ["inherit"] }, "worker", undefined);
+		const violation = checkModelScope("openai/gpt-5-mini", scope, "explicit");
+		assert.equal(violation?.severity, "error");
+		assert.deepEqual(violation?.allowedPatterns, ["inherit"]);
+	});
+
+	it("does not apply another agent's scope", () => {
+		assert.deepEqual(resolveModelScopesForAgent({ enforce: true, agents: { reviewer: { allow: ["inherit"] } } }, "worker", { provider: "openai", id: "gpt-5" }), []);
+	});
+});
+
 describe("parseModelScopeConfig", () => {
 	const meta = { filePath: "~/.pi/agent/settings.json" };
 
@@ -105,8 +140,15 @@ describe("parseModelScopeConfig", () => {
 
 	it("parses a well-formed config", () => {
 		assert.deepEqual(
-			parseModelScopeConfig({ enforce: true, allow: ["anthropic/*", "openai/gpt-5-*"] }, meta),
-			{ enforce: true, allow: ["anthropic/*", "openai/gpt-5-*"] },
+			parseModelScopeConfig({ enforce: true, strict: true, allow: ["anthropic/*", "openai/gpt-5-*"] }, meta),
+			{ enforce: true, strict: true, allow: ["anthropic/*", "openai/gpt-5-*"] },
+		);
+	});
+
+	it("parses per-agent scopes and permits agent-only enforcement", () => {
+		assert.deepEqual(
+			parseModelScopeConfig({ enforce: true, strict: true, agents: { worker: { allow: [" openai/gpt-5-mini "] }, unknown: { enforce: false } } }, meta),
+			{ enforce: true, strict: true, agents: { worker: { allow: ["openai/gpt-5-mini"] }, unknown: { enforce: false } } },
 		);
 	});
 
@@ -130,6 +172,10 @@ describe("parseModelScopeConfig", () => {
 		assert.throws(() => parseModelScopeConfig({ enforce: "yes" }, meta), /invalid 'modelScope.enforce'/);
 	});
 
+	it("rejects a non-boolean strict value", () => {
+		assert.throws(() => parseModelScopeConfig({ strict: "yes" }, meta), /invalid 'modelScope.strict'/);
+	});
+
 	it("rejects a non-array allow", () => {
 		assert.throws(() => parseModelScopeConfig({ allow: "anthropic/*" }, meta), /invalid 'modelScope.allow'/);
 	});
@@ -141,5 +187,12 @@ describe("parseModelScopeConfig", () => {
 	it("rejects enforce without a non-empty allow list", () => {
 		assert.throws(() => parseModelScopeConfig({ enforce: true }, meta), /without a non-empty 'allow'/);
 		assert.throws(() => parseModelScopeConfig({ enforce: true, allow: [] }, meta), /non-empty array of patterns/);
+	});
+
+	it("rejects invalid agent scope shapes with the full field path", () => {
+		assert.throws(() => parseModelScopeConfig({ enforce: true, agents: { worker: [] } }, meta), /modelScope\.agents\.worker/);
+		assert.throws(() => parseModelScopeConfig({ agents: { worker: { allow: [] } } }, meta), /modelScope\.agents\.worker\.allow/);
+		assert.throws(() => parseModelScopeConfig({ agents: { worker: { agents: {} } } }, meta), /modelScope\.agents\.worker\.agents/);
+		assert.throws(() => parseModelScopeConfig({ agents: { " ": { allow: ["inherit"] } } }, meta), /non-empty agent name/);
 	});
 });

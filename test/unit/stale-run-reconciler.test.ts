@@ -3,6 +3,7 @@ import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import { describe, it } from "node:test";
+import { writeAsyncResultFile, writePendingAsyncResultFile } from "../../src/runs/background/result-files.ts";
 import { checkPidLiveness, reconcileAsyncRun } from "../../src/runs/background/stale-run-reconciler.ts";
 
 function tempRoot(prefix: string): string {
@@ -28,14 +29,71 @@ describe("async stale-run reconciliation", () => {
 		assert.equal(checkPidLiveness(123, () => { throw new Error("boom"); }), "unknown");
 	});
 
-	it("marks a running async run failed when the runner pid is dead and no result exists", () => {
+	it("marks a dead runner failed and writes exactly one completion result", () => {
 		const root = tempRoot("pi-stale-run-");
 		try {
 			const asyncDir = path.join(root, "run-dead");
 			const resultsDir = path.join(root, "results");
 			writeStatus(asyncDir, {
+				lifecycleArtifactVersion: 3,
 				runId: "run-dead",
 				sessionId: "session-current",
+				completionOwnerId: "owner-current",
+				mode: "single",
+				state: "running",
+				pid: 12345,
+				processTerminal: { version: 1, state: "pending", runId: "run-dead", runnerProcessInstanceId: "runner-dead" },
+				startedAt: 1000,
+				lastUpdate: 1000,
+				currentStep: 0,
+				steps: [{ agent: "scout", status: "running", startedAt: 1000, contextOverflow: true }],
+			});
+
+			const result = reconcileAsyncRun(asyncDir, {
+				resultsDir,
+				kill: () => { throw errno("ESRCH"); },
+				now: () => 2000,
+			});
+
+			assert.equal(result.repaired, true);
+			assert.equal(result.status?.state, "failed");
+			assert.match(result.message ?? "", /process 12345 exited or disappeared/);
+			const status = JSON.parse(fs.readFileSync(path.join(asyncDir, "status.json"), "utf-8"));
+			assert.equal(status.state, "failed");
+			assert.equal(status.sessionId, "session-current");
+			assert.equal(status.completionOwnerId, "owner-current");
+			assert.equal(status.steps[0].status, "failed");
+			assert.match(status.steps[0].error, /process 12345 exited or disappeared/);
+			const resultJson = JSON.parse(fs.readFileSync(path.join(resultsDir, "run-dead.json"), "utf-8"));
+			assert.equal(resultJson.success, false);
+			assert.equal(resultJson.sessionId, "session-current");
+			assert.equal(resultJson.completionOwnerId, "owner-current");
+			assert.equal(resultJson.state, "failed");
+			assert.equal(resultJson.exitCode, 1);
+			assert.equal(resultJson.results[0].contextOverflow, true);
+			assert.match(resultJson.summary, /process 12345 exited or disappeared/);
+			assert.match(fs.readFileSync(path.join(asyncDir, "events.jsonl"), "utf-8"), /subagent\.run\.repaired_stale/);
+
+			const resultText = fs.readFileSync(path.join(resultsDir, "run-dead.json"), "utf-8");
+			const second = reconcileAsyncRun(asyncDir, {
+				resultsDir,
+				kill: () => { throw errno("ESRCH"); },
+				now: () => 3000,
+			});
+			assert.equal(second.repaired, false);
+			assert.equal(fs.readFileSync(path.join(resultsDir, "run-dead.json"), "utf-8"), resultText);
+		} finally {
+			fs.rmSync(root, { recursive: true, force: true });
+		}
+	});
+
+	it("repairs sessionless stale status without writing an unindexed result", () => {
+		const root = tempRoot("pi-stale-run-sessionless-");
+		try {
+			const asyncDir = path.join(root, "run-sessionless");
+			const resultsDir = path.join(root, "results");
+			writeStatus(asyncDir, {
+				runId: "run-sessionless",
 				mode: "single",
 				state: "running",
 				pid: 12345,
@@ -52,20 +110,9 @@ describe("async stale-run reconciliation", () => {
 			});
 
 			assert.equal(result.repaired, true);
-			assert.equal(result.status?.state, "failed");
-			assert.match(result.message ?? "", /process 12345 exited or disappeared/);
-			const status = JSON.parse(fs.readFileSync(path.join(asyncDir, "status.json"), "utf-8"));
-			assert.equal(status.state, "failed");
-			assert.equal(status.sessionId, "session-current");
-			assert.equal(status.steps[0].status, "failed");
-			assert.match(status.steps[0].error, /process 12345 exited or disappeared/);
-			const resultJson = JSON.parse(fs.readFileSync(path.join(resultsDir, "run-dead.json"), "utf-8"));
-			assert.equal(resultJson.success, false);
-			assert.equal(resultJson.sessionId, "session-current");
-			assert.equal(resultJson.state, "failed");
-			assert.equal(resultJson.exitCode, 1);
-			assert.match(resultJson.summary, /process 12345 exited or disappeared/);
-			assert.match(fs.readFileSync(path.join(asyncDir, "events.jsonl"), "utf-8"), /subagent\.run\.repaired_stale/);
+			assert.equal(result.resultPath, undefined);
+			assert.equal(JSON.parse(fs.readFileSync(path.join(asyncDir, "status.json"), "utf-8")).state, "failed");
+			assert.equal(fs.existsSync(path.join(resultsDir, "run-sessionless.json")), false);
 		} finally {
 			fs.rmSync(root, { recursive: true, force: true });
 		}
@@ -78,6 +125,7 @@ describe("async stale-run reconciliation", () => {
 			const resultsDir = path.join(root, "results");
 			writeStatus(asyncDir, {
 				runId: "run-dead-stderr",
+				sessionId: "session-current",
 				mode: "single",
 				state: "running",
 				pid: 12345,
@@ -113,6 +161,7 @@ describe("async stale-run reconciliation", () => {
 			const resultsDir = path.join(root, "results");
 			writeStatus(asyncDir, {
 				runId: "run-dead-events-dir",
+				sessionId: "session-current",
 				mode: "single",
 				state: "running",
 				pid: 12345,
@@ -165,7 +214,7 @@ describe("async stale-run reconciliation", () => {
 				state: "failed",
 				results: [
 					{ agent: "scout", success: true, sessionFile: scoutSession, model: "fast", attemptedModels: ["planned-scout", "fast"] },
-					{ agent: "worker", success: false, error: "boom", sessionFile: workerSession, model: "careful", attemptedModels: ["planned-worker", "careful"] },
+					{ agent: "worker", success: false, error: "boom", sessionFile: workerSession, model: "careful", attemptedModels: ["planned-worker", "careful"], contextOverflow: true },
 				],
 			}, null, 2), "utf-8");
 
@@ -187,8 +236,102 @@ describe("async stale-run reconciliation", () => {
 			assert.equal(result.status?.steps?.[1]?.error, "boom");
 			assert.equal(result.status?.steps?.[1]?.model, "careful");
 			assert.deepEqual(result.status?.steps?.[1]?.attemptedModels, ["planned-worker", "careful"]);
+			assert.equal(result.status?.steps?.[1]?.contextOverflow, true);
 			assert.equal(result.status?.steps?.[1]?.sessionFile, workerSession);
 		} finally {
+			fs.rmSync(root, { recursive: true, force: true });
+		}
+	});
+
+	it("repairs stale running status from an indexed pending result", () => {
+		const root = tempRoot("pi-stale-indexed-pending-result-");
+		const originalError = console.error;
+		try {
+			console.error = () => {};
+			const asyncDir = path.join(root, "run-pending-result");
+			const resultsDir = path.join(root, "results");
+			writeStatus(asyncDir, {
+				runId: "run-pending-result",
+				sessionId: "session-current",
+				mode: "single",
+				state: "running",
+				pid: 12345,
+				startedAt: 1000,
+				lastUpdate: 1000,
+				currentStep: 0,
+				steps: [{ agent: "worker", status: "running", startedAt: 1000 }],
+			});
+			const publicResultPath = path.join(resultsDir, "run-pending-result.json");
+			fs.mkdirSync(publicResultPath, { recursive: true });
+			assert.deepEqual(writeAsyncResultFile(publicResultPath, {
+				id: "run-pending-result",
+				runId: "run-pending-result",
+				sessionId: "session-current",
+				success: true,
+				state: "complete",
+				summary: "already done",
+			}), { state: "pending" });
+
+			const result = reconcileAsyncRun(asyncDir, {
+				resultsDir,
+				kill: () => { throw errno("ESRCH"); },
+				now: () => 2000,
+			});
+
+			assert.equal(result.repaired, true);
+			assert.equal(result.status?.state, "complete");
+			assert.equal(result.status?.steps?.[0]?.status, "complete");
+			assert.equal(JSON.parse(fs.readFileSync(path.join(asyncDir, "status.json"), "utf-8")).state, "complete");
+			assert.equal(fs.statSync(publicResultPath).isDirectory(), true);
+			assert.match(fs.readFileSync(result.resultPath!, "utf-8"), /already done/);
+		} finally {
+			console.error = originalError;
+			fs.rmSync(root, { recursive: true, force: true });
+		}
+	});
+
+	it("repairs stale rejected status from an indexed pending status snapshot", () => {
+		const root = tempRoot("pi-stale-rejected-pending-result-");
+		const originalError = console.error;
+		try {
+			console.error = () => {};
+			const asyncDir = path.join(root, "run-rejected");
+			const resultsDir = path.join(root, "results");
+			writeStatus(asyncDir, {
+				runId: "run-rejected",
+				sessionId: "session-current",
+				mode: "chain",
+				state: "rejected",
+				pid: 12345,
+				startedAt: 1000,
+				lastUpdate: 1000,
+				currentStep: 0,
+				steps: [{ agent: "worker", status: "rejected", startedAt: 1000, error: "Run rejected." }],
+			});
+			const publicResultPath = path.join(resultsDir, "run-rejected.json");
+			fs.mkdirSync(publicResultPath, { recursive: true });
+			writePendingAsyncResultFile(publicResultPath, {
+				id: "run-rejected",
+				runId: "run-rejected",
+				sessionId: "session-current",
+				success: false,
+				state: "rejected",
+				summary: "Run rejected.",
+				results: [{ agent: "worker", success: false, error: "Run rejected." }],
+			});
+
+			const result = reconcileAsyncRun(asyncDir, {
+				resultsDir,
+				kill: () => { throw errno("ESRCH"); },
+				now: () => 2000,
+			});
+
+			assert.equal(result.repaired, false);
+			assert.equal(result.status?.state, "rejected");
+			assert.equal(result.status?.steps?.[0]?.status, "rejected");
+			assert.match(fs.readFileSync(result.resultPath!, "utf-8"), /Run rejected/);
+		} finally {
+			console.error = originalError;
 			fs.rmSync(root, { recursive: true, force: true });
 		}
 	});

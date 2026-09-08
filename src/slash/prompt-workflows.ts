@@ -1,10 +1,9 @@
 import * as fs from "node:fs";
 import * as path from "node:path";
-import { fileURLToPath } from "node:url";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { parseFrontmatter } from "../agents/frontmatter.ts";
 import type { SubagentParamsLike } from "../runs/foreground/subagent-executor.ts";
-import { getAgentDir, getProjectConfigDir } from "../shared/utils.ts";
+import { getPromptDirectories } from "../shared/prompt-resources.ts";
 
 interface PromptWorkflow {
 	name: string;
@@ -32,21 +31,9 @@ const RESERVED_COMMAND_NAMES = new Set([
 	"subagents-models",
 ]);
 
-function packagePromptsDir(): string {
-	return path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..", "..", "prompts");
-}
-
-function promptDirs(cwd: string): string[] {
-	return [
-		packagePromptsDir(),
-		path.join(getAgentDir(), "prompts"),
-		path.join(getProjectConfigDir(cwd), "prompts"),
-	];
-}
-
 function readPromptFiles(cwd: string): string[] {
 	const files: string[] = [];
-	for (const dir of promptDirs(cwd)) {
+	for (const dir of Object.values(getPromptDirectories(cwd))) {
 		let entries: fs.Dirent[];
 		try {
 			entries = fs.readdirSync(dir, { withFileTypes: true });
@@ -213,13 +200,19 @@ function workflowParams(workflow: PromptWorkflow, args: string[], runtime: Retur
 	return {
 		agent: runtime.agentOverride ?? workflow.agent,
 		task,
-		clarify: false,
 		agentScope: "both",
 		...(context ? { context } : {}),
 		...(workflow.model ? { model: workflow.model } : {}),
 		...(workflow.skill !== undefined ? { skill: workflow.skill } : {}),
 		...(workflow.cwd ? { cwd: workflow.cwd } : {}),
-		...(runtime.bg ? { async: true } : {}),
+	};
+}
+
+function promptWorkflowExecutionParams(workflows: PromptWorkflow[], args: string[], runtime: ReturnType<typeof parseRuntimeOptions>): SubagentParamsLike {
+	return {
+		workflowScript: promptWorkflowScript(workflows, args, runtime),
+		agentScope: "both",
+		async: runtime.bg ? true : false,
 	};
 }
 
@@ -281,10 +274,10 @@ export function registerPromptWorkflowCommands(input: {
 						if (!step) throw new Error(`Unknown prompt workflow in chain '${workflow.name}': ${stepName}`);
 						return step;
 					});
-					await run({ workflowScript: promptWorkflowScript(chain, runtime.args, runtime), clarify: false, agentScope: "both", ...(runtime.bg ? { async: true } : {}) }, ctx);
+					await run(promptWorkflowExecutionParams(chain, runtime.args, runtime), ctx);
 					return;
 				}
-				await run(workflowParams(workflow, runtime.args, runtime), ctx);
+				await run(promptWorkflowExecutionParams([workflow], runtime.args, runtime), ctx);
 			} catch (error) {
 				ctx.ui.notify(error instanceof Error ? error.message : String(error), "error");
 			}

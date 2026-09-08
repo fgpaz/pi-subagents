@@ -1,21 +1,16 @@
-/**
- * General utility functions for the subagent extension
- */
-
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
-import type { Message } from "@earendil-works/pi-ai";
+import type { Message, Usage as PiUsage } from "@earendil-works/pi-ai";
+import { previewDisplayText, sanitizeDisplayText, truncateDisplayText } from "./display-text.ts";
 import { formatToolCall } from "./formatters.ts";
 import type { AgentProgress, AsyncStatus, Details, DisplayItem, ErrorInfo, NestedRunSummary, SingleResult, ToolCallSummary, Usage } from "./types.ts";
-
-// ============================================================================
-// File System Utilities
-// ============================================================================
+import { validateAsyncStatusLaneMetadata } from "../runs/shared/lane-metadata.ts";
 
 const DEFAULT_CONFIG_DIR_NAME = ".pi";
 const PI_CODING_AGENT_PACKAGE_NAME = "@earendil-works/pi-coding-agent";
 export const PI_CODING_AGENT_PACKAGE_ROOT_ENV = "PI_SUBAGENTS_PI_CODING_AGENT_PACKAGE_ROOT";
+export const PROMPT_REDACTED = "[prompt redacted]";
 
 export function resolveWatchPath(
 	watchPath: string,
@@ -94,12 +89,31 @@ export function getProjectConfigDir(projectRoot: string): string {
 
 export function getAgentDir(): string {
 	const configured = process.env.PI_CODING_AGENT_DIR;
-	if (configured === "~") return os.homedir();
-	if (configured?.startsWith("~/")) return path.join(os.homedir(), configured.slice(2));
-	return configured || path.join(os.homedir(), getConfigDirName(), "agent");
+	const home = process.env.HOME || process.env.USERPROFILE || os.homedir();
+	if (configured === "~") return home;
+	if (configured?.startsWith("~/") || configured?.startsWith("~\\")) return path.join(home, configured.slice(2));
+	return configured || path.join(home, getConfigDirName(), "agent");
 }
 
 const statusCache = new Map<string, { mtime: number; ctime: number; size: number; ino: number; status: AsyncStatus }>();
+const MAX_STATUS_CACHE_ENTRIES = 512;
+
+export function pruneStatusCacheForAsyncRoot(asyncDirRoot: string, runIds: Iterable<string>): number {
+	const root = path.resolve(asyncDirRoot);
+	const currentStatusPaths = new Set(
+		Array.from(runIds, (runId) => path.resolve(root, runId, "status.json")),
+	);
+	let removed = 0;
+	for (const statusPath of statusCache.keys()) {
+		const resolved = path.resolve(statusPath);
+		const relative = path.relative(root, resolved);
+		if (relative && !relative.startsWith("..") && !path.isAbsolute(relative) && !currentStatusPaths.has(resolved)) {
+			statusCache.delete(statusPath);
+			removed++;
+		}
+	}
+	return removed;
+}
 
 function getErrorMessage(error: unknown): string {
 	return error instanceof Error ? error.message : String(error);
@@ -121,13 +135,19 @@ function isNotFoundError(error: unknown): boolean {
  * Read async job status from disk (with mtime-based caching)
  */
 export function readStatus(asyncDir: string): AsyncStatus | null {
+	if (Buffer.byteLength(path.basename(asyncDir), "utf-8") > 255) {
+		return null;
+	}
 	const statusPath = path.join(asyncDir, "status.json");
 
 	let stat: fs.Stats;
 	try {
 		stat = fs.statSync(statusPath);
 	} catch (error) {
-		if (isNotFoundError(error)) return null;
+		if (isNotFoundError(error)) {
+			statusCache.delete(statusPath);
+			return null;
+		}
 		throw new Error(`Failed to inspect async status file '${statusPath}': ${getErrorMessage(error)}`, {
 			cause: error instanceof Error ? error : undefined,
 		});
@@ -141,6 +161,8 @@ export function readStatus(asyncDir: string): AsyncStatus | null {
 		&& cached.size === stat.size
 		&& cached.ino === stat.ino
 	) {
+		statusCache.delete(statusPath);
+		statusCache.set(statusPath, cached);
 		return cached.status;
 	}
 
@@ -148,7 +170,10 @@ export function readStatus(asyncDir: string): AsyncStatus | null {
 	try {
 		content = fs.readFileSync(statusPath, "utf-8");
 	} catch (error) {
-		if (isNotFoundError(error)) return null;
+		if (isNotFoundError(error)) {
+			statusCache.delete(statusPath);
+			return null;
+		}
 		throw new Error(`Failed to read async status file '${statusPath}': ${getErrorMessage(error)}`, {
 			cause: error instanceof Error ? error : undefined,
 		});
@@ -162,6 +187,13 @@ export function readStatus(asyncDir: string): AsyncStatus | null {
 			cause: error instanceof Error ? error : undefined,
 		});
 	}
+	try {
+		validateAsyncStatusLaneMetadata(status, `Invalid async status '${statusPath}'`);
+	} catch (error) {
+		throw new Error(`Failed to validate async status file '${statusPath}': ${getErrorMessage(error)}`, {
+			cause: error instanceof Error ? error : undefined,
+		});
+	}
 
 	statusCache.set(statusPath, {
 		mtime: stat.mtimeMs,
@@ -170,64 +202,15 @@ export function readStatus(asyncDir: string): AsyncStatus | null {
 		ino: stat.ino,
 		status,
 	});
-	if (statusCache.size > 50) {
-		const firstKey = statusCache.keys().next().value;
-		if (firstKey) statusCache.delete(firstKey);
+	while (statusCache.size > MAX_STATUS_CACHE_ENTRIES) {
+		const oldest = statusCache.keys().next().value as string | undefined;
+		if (oldest === undefined) break;
+		statusCache.delete(oldest);
 	}
 	return status;
 }
 
-const outputTailCache = new Map<string, { mtime: number; size: number; lines: string[] }>();
-
-/**
- * Get the last N lines from an output file (with mtime/size-based caching)
- */
-function getOutputTail(outputFile: string | undefined, maxLines: number = 3): string[] {
-	if (!outputFile) return [];
-	let fd: number | null = null;
-	try {
-		const stat = fs.statSync(outputFile);
-		if (stat.size === 0) return [];
-
-		const cached = outputTailCache.get(outputFile);
-		if (cached && cached.mtime === stat.mtimeMs && cached.size === stat.size) {
-			return cached.lines;
-		}
-
-		const tailBytes = 4096;
-		const start = Math.max(0, stat.size - tailBytes);
-		fd = fs.openSync(outputFile, "r");
-		const buffer = Buffer.alloc(Math.min(tailBytes, stat.size));
-		fs.readSync(fd, buffer, 0, buffer.length, start);
-		const content = buffer.toString("utf-8");
-		const allLines = content.split("\n").filter((l) => l.trim());
-		const lines = allLines.slice(-maxLines).map((l) => l.slice(0, 120) + (l.length > 120 ? "..." : ""));
-
-		outputTailCache.set(outputFile, { mtime: stat.mtimeMs, size: stat.size, lines });
-		if (outputTailCache.size > 20) {
-			const firstKey = outputTailCache.keys().next().value;
-			if (firstKey) outputTailCache.delete(firstKey);
-		}
-
-		return lines;
-	} catch {
-		// Output tails are UI-only hints; unreadable or missing files should render as no tail.
-		return [];
-	} finally {
-		if (fd !== null) {
-			try {
-				fs.closeSync(fd);
-			} catch {
-				// Closing the best-effort tail file handle should not surface over the main status view.
-			}
-		}
-	}
-}
-
-/**
- * Get human-readable last activity time for a file
- */
-	export function getLastActivity(outputFile: string | undefined): string {
+export function getLastActivity(outputFile: string | undefined): string {
 	if (!outputFile) return "";
 	try {
 		const stat = fs.statSync(outputFile);
@@ -236,14 +219,11 @@ function getOutputTail(outputFile: string | undefined, maxLines: number = 3): st
 		if (ago < 60000) return `active ${Math.floor(ago / 1000)}s ago`;
 		return `active ${Math.floor(ago / 60000)}m ago`;
 	} catch {
-		// Last-activity text is best effort; missing files should simply omit the hint.
+		// Last-activity text is best effort; missing files should omit the hint.
 		return "";
 	}
 }
 
-/**
- * Find the latest session file in a directory
- */
 export function findLatestSessionFile(sessionDir: string): string | null {
 	if (!fs.existsSync(sessionDir)) return null;
 	const files = fs.readdirSync(sessionDir)
@@ -260,23 +240,12 @@ export function findLatestSessionFile(sessionDir: string): string | null {
 	return latest ? latest.path : null;
 }
 
-/**
- * Write a prompt to a temporary file
- */
-function writePrompt(agent: string, prompt: string): { dir: string; path: string } {
-	const dir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-subagent-"));
-	const p = path.join(dir, `${agent.replace(/[^\w.-]/g, "_")}.md`);
-	fs.writeFileSync(p, prompt, { mode: 0o600 });
-	return { dir, path: p };
+const PI_TURN_TIMING_FOOTER = /(?:\r?\n)*\x1b\[38;2;136;136;136m✻ Turn took [^()\r\n]+ \(Total time [^·\r\n]+ · \d+ turns?\)\x1b\[0m[ \t]*$/u;
+
+function stripPiTurnTimingFooter(text: string): string {
+	return text.replace(PI_TURN_TIMING_FOOTER, "");
 }
 
-// ============================================================================
-// Message Parsing Utilities
-// ============================================================================
-
-/**
- * Get the final text output from a list of messages
- */
 export function getFinalOutput(messages: Message[]): string {
 	const validTextParts: string[] = [];
 	for (let i = messages.length - 1; i >= 0; i--) {
@@ -286,21 +255,26 @@ export function getFinalOutput(messages: Message[]): string {
 			|| ("stopReason" in msg && msg.stopReason === "error");
 		if (hasAssistantError) continue;
 		const messageText = msg.content
-			.filter((part) => part.type === "text" && part.text.trim().length > 0)
-			.map((part) => part.type === "text" ? part.text : "")
+			.flatMap((part) => {
+				if (part.type !== "text") return [];
+				const text = stripPiTurnTimingFooter(part.text);
+				return text.trim().length > 0 ? [text] : [];
+			})
 			.join("\n");
 		for (let j = msg.content.length - 1; j >= 0; j--) {
 			const part = msg.content[j];
-			if (!part || part.type !== "text" || part.text.trim().length === 0) continue;
-			validTextParts.push(part.text);
-			if (/```acceptance[-_]report\s*\n[\s\S]*?```/i.test(part.text)) return messageText;
-			for (const match of part.text.matchAll(/```(?:json|jsonc|json5)\s*\n([\s\S]*?)```/gi)) {
+			if (!part || part.type !== "text") continue;
+			const text = stripPiTurnTimingFooter(part.text);
+			if (text.trim().length === 0) continue;
+			validTextParts.push(text);
+			if (/```acceptance[-_]report\s*\n[\s\S]*?```/i.test(text)) return messageText;
+			for (const match of text.matchAll(/```(?:json|jsonc|json5)\s*\n([\s\S]*?)```/gi)) {
 				const body = match[1] ?? "";
 				if (/"(?:criteriaSatisfied|criteria_satisfied)"/.test(body) && /"(?:changedFiles|changed_files|testsAddedOrUpdated|tests_added_or_updated|commandsRun|commands_run|validationOutput|validation_output|residualRisks|residual_risks|noStagedFiles|no_staged_files|diffSummary|diff_summary|reviewFindings|review_findings|manualNotes|manual_notes)"/.test(body)) {
 					return messageText;
 				}
 			}
-			if (/ACCEPTANCE_REPORT\s*:/i.test(part.text)) return messageText;
+			if (/ACCEPTANCE_REPORT\s*:/i.test(text)) return messageText;
 		}
 	}
 	return validTextParts[0] ?? "";
@@ -332,9 +306,10 @@ function compactCompletedProgress(progress: AgentProgress): AgentProgress {
 	return {
 		index: progress.index,
 		agent: progress.agent,
+		...(progress.sessionName ? { sessionName: progress.sessionName } : {}),
 		status: progress.status,
 		activityState: progress.activityState,
-		task: progress.task,
+		task: "[prompt redacted]",
 		skills: progress.skills,
 		toolCount: progress.toolCount,
 		tokens: progress.tokens,
@@ -378,6 +353,17 @@ export function sumResultsUsage(results: SingleResult[]): Usage {
 	return usage;
 }
 
+export function toAgentToolUsage(usage: Usage): PiUsage {
+	return {
+		input: usage.input,
+		output: usage.output,
+		cacheRead: usage.cacheRead,
+		cacheWrite: usage.cacheWrite,
+		totalTokens: usage.input + usage.output + usage.cacheRead + usage.cacheWrite,
+		cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: usage.cost },
+	};
+}
+
 function addNestedCost(total: NonNullable<Details["totalCost"]>, children: NestedRunSummary[] | undefined): void {
 	for (const child of children ?? []) {
 		if (child.totalCost) {
@@ -408,6 +394,7 @@ export function compactForegroundResult(result: SingleResult): SingleResult {
 	const toolCalls = result.toolCalls?.length ? result.toolCalls : extractToolCallSummaries(result.messages);
 	return {
 		...result,
+		task: "[prompt redacted]",
 		messages: undefined,
 		progress: undefined,
 		toolCalls: toolCalls.length ? toolCalls : undefined,
@@ -429,10 +416,9 @@ export function compactForegroundDetails(details: Details): Details {
  *
  * The completed-compaction helpers above bail out while a child is still
  * `running`, so a long or deeply nested fan-out streams full, unbounded progress on
- * every tick. Pi serializes each streamed `tool_execution_update` as a single
- * child-stdout line, which the parent reads under `MAX_CHILD_PENDING_LINE_BYTES`;
- * an unbounded running snapshot can cross that cap and kill the child with
- * `protocol_output_limit`.
+ * every tick. The parent records every streamed `tool_execution_update` in its
+ * transcript and `events.jsonl`, so an unbounded running snapshot grows those
+ * artifacts and the live display state without bound.
  *
  * These bound the STREAMED snapshot only. The final returned result keeps the full
  * live progress and message transcript, and every live-display consumer already
@@ -471,8 +457,27 @@ export function hasEmptyTerminalAssistantResponse(messages: Message[]): boolean 
 	const lastAssistant = messages.findLast((message) => message.role === "assistant");
 	return lastAssistant?.role === "assistant"
 		&& Array.isArray(lastAssistant.content)
-		&& lastAssistant.content.length === 0
-		&& lastAssistant.usage.output === 0;
+		&& ((lastAssistant.content.length === 0 && lastAssistant.usage.output === 0)
+			|| (messages.at(-1) === lastAssistant
+				&& lastAssistant.stopReason === "stop"
+				&& !lastAssistant.errorMessage
+				&& lastAssistant.content.length > 0
+				// Token accounting can be nonzero even when no response text was emitted.
+				&& lastAssistant.content.every((part) => part.type === "text" && part.text === "")));
+}
+
+export function formatEmptyTerminalAssistantResponseError(messages: Message[]): string {
+	const lastAssistant = messages.findLast((message) => message.role === "assistant");
+	const errorMessage = lastAssistant && "errorMessage" in lastAssistant && typeof lastAssistant.errorMessage === "string" && lastAssistant.errorMessage.trim()
+		? lastAssistant.errorMessage.trim()
+		: undefined;
+	if (errorMessage) return errorMessage;
+	const stopReason = lastAssistant && "stopReason" in lastAssistant && typeof lastAssistant.stopReason === "string" && lastAssistant.stopReason.trim()
+		? lastAssistant.stopReason.trim()
+		: undefined;
+	return stopReason && stopReason !== "stop"
+		? `Subagent produced no output after terminal assistant stopReason "${stopReason}".`
+		: "Subagent produced no output (possible model cold-start or empty response).";
 }
 
 /**
@@ -522,11 +527,8 @@ export function detectSubagentError(messages: Message[]): ErrorInfo {
  * Extract a preview of tool arguments for display
  */
 export function extractToolArgsPreview(args: Record<string, unknown>): string {
-	const truncatePreview = (value: string, maxLength: number): string =>
-		value.length > maxLength ? `${value.slice(0, maxLength - 3)}...` : value;
-
 	const stringifyPreviewValue = (value: unknown): string | undefined => {
-		if (typeof value === "string" && value.trim().length > 0) return value;
+		if (typeof value === "string" && value.trim().length > 0) return sanitizeDisplayText(value);
 		if (typeof value === "number" || typeof value === "boolean") return String(value);
 		return undefined;
 	};
@@ -539,39 +541,32 @@ export function extractToolArgsPreview(args: Record<string, unknown>): string {
 		return `${first}${suffix}`;
 	};
 
-	// Handle MCP tool calls - show server/tool info
-	if (args.tool && typeof args.tool === "string") {
-		const server = args.server && typeof args.server === "string" ? `${args.server}/` : "";
-		const toolArgs = args.args && typeof args.args === "string" ? ` ${args.args.slice(0, 40)}` : "";
-		return `${server}${args.tool}${toolArgs}`;
+	if (typeof args.tool === "string") {
+		const server = typeof args.server === "string" ? `${sanitizeDisplayText(args.server)}/` : "";
+		const toolArgs = typeof args.args === "string" ? ` ${truncateDisplayText(sanitizeDisplayText(args.args), 40)}` : "";
+		return sanitizeDisplayText(`${server}${args.tool}${toolArgs}`);
 	}
 
 	const queriesPreview = previewArray(args.queries);
-	if (queriesPreview) return truncatePreview(queriesPreview, 60);
-	if (typeof args.query === "string" && args.query.trim().length > 0) return truncatePreview(args.query, 60);
-	if (typeof args.workflow === "string" && args.workflow.trim().length > 0) return `workflow=${truncatePreview(args.workflow, 48)}`;
+	if (queriesPreview) return previewDisplayText(queriesPreview, 60);
+	if (typeof args.query === "string" && args.query.trim().length > 0) return previewDisplayText(args.query, 60);
+	if (typeof args.workflow === "string" && args.workflow.trim().length > 0) return `workflow=${previewDisplayText(args.workflow, 48)}`;
 
-	if (typeof args.url === "string" && args.url.trim().length > 0) return truncatePreview(args.url, 60);
+	if (typeof args.url === "string" && args.url.trim().length > 0) return previewDisplayText(args.url, 60);
 	const urlsPreview = previewArray(args.urls);
-	if (urlsPreview) return truncatePreview(urlsPreview, 60);
-	if (typeof args.prompt === "string" && args.prompt.trim().length > 0) return truncatePreview(args.prompt, 60);
-	
+	if (urlsPreview) return previewDisplayText(urlsPreview, 60);
+	if (typeof args.prompt === "string" && args.prompt.trim().length > 0) return previewDisplayText(args.prompt, 60);
+
 	const previewKeys = ["command", "path", "file_path", "pattern", "query", "url", "task", "describe", "search"];
 	for (const key of previewKeys) {
-		if (args[key] && typeof args[key] === "string") {
-			const value = args[key] as string;
-			return truncatePreview(value, 60);
-		}
+		if (typeof args[key] === "string") return previewDisplayText(args[key], 60);
 	}
-	
-	// Fallback: show first string value found
+
 	for (const [key, value] of Object.entries(args)) {
+		const displayKey = sanitizeDisplayText(key);
 		const arrayPreview = previewArray(value);
-		if (arrayPreview) return `${key}=${truncatePreview(arrayPreview, 50)}`;
-		if (typeof value === "string" && value.length > 0) {
-			const preview = truncatePreview(value, 50);
-			return `${key}=${preview}`;
-		}
+		if (arrayPreview) return `${displayKey}=${previewDisplayText(arrayPreview, 50)}`;
+		if (typeof value === "string" && value.length > 0) return `${displayKey}=${previewDisplayText(value, 50)}`;
 	}
 	return "";
 }

@@ -52,6 +52,38 @@ describe("slash subagent bridge requester context", () => {
     await done;
   });
 
+  it("passes structured single-child execution to the direct path", async () => {
+    const events = eventBus();
+    let executedParams: any;
+    registerSlashSubagentBridge({
+      events,
+      getContext: () => ({ cwd: "/repo" }) as any,
+      execute: async (_id, params) => {
+        executedParams = params;
+        return { content: [{ type: "text", text: "ok" }], details: { mode: "workflow", results: [] } } as any;
+      },
+    });
+
+    const done = new Promise<void>((resolve, reject) => {
+      events.on(RESPONSE, (data: any) => {
+        try {
+          assert.equal(data.isError, false);
+          assert.equal(executedParams.agent, "worker");
+          assert.equal(executedParams.task, "work");
+          assert.equal(executedParams.async, false);
+          assert.equal(executedParams.output, true);
+          assert.equal(executedParams.workflowScript, undefined);
+          resolve();
+        } catch (error) {
+          reject(error);
+        }
+      });
+    });
+
+    events.emit(REQUEST, { requestId: "structured-single", params: { agent: "worker", task: "work", async: false } });
+    await done;
+  });
+
   it("rejects removed chain and parallel inputs before executor dispatch", async () => {
     const events = eventBus();
     let executeCalls = 0;

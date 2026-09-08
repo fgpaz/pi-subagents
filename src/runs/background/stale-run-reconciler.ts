@@ -1,10 +1,15 @@
 import * as fs from "node:fs";
 import * as path from "node:path";
 import { writeAtomicJson } from "../../shared/atomic-json.ts";
+import { resultFilePath, resultPayloadPathForSessionRun, writeAsyncResultFile } from "./result-files.ts";
+import { updateActiveRunIndex } from "./active-run-index.ts";
+import { readStatus } from "../../shared/utils.ts";
 import { DIRS, type AsyncParallelGroupStatus, type AsyncStatus, type NestedRunSummary, type SubagentRunMode } from "../../shared/types.ts";
 import { resolveEffectiveThinking } from "../../shared/model-info.ts";
 import { normalizeParallelGroups } from "./parallel-groups.ts";
 import { nestedSummaryFromAsyncStatus, projectNestedEvents, resolveNestedAsyncDir, writeNestedEvent, type NestedRoute } from "../shared/nested-events.ts";
+import { assertWorkflowGraphHostSteps } from "../shared/host-step-status.ts";
+import type { RawDrainStatusObserver } from "../shared/readonly-drain-observation.ts";
 
 export type PidLiveness = "alive" | "dead" | "unknown";
 
@@ -14,12 +19,14 @@ interface StartedRunMetadata {
 	runId: string;
 	pid?: number;
 	sessionId?: string;
+	completionOwnerId?: string;
 	mode?: SubagentRunMode;
 	agents?: string[];
 	chainStepCount?: number;
 	parallelGroups?: AsyncParallelGroupStatus[];
 	startedAt?: number;
 	sessionFile?: string;
+	sessionName?: string;
 }
 
 interface ReconcileAsyncRunOptions {
@@ -84,28 +91,9 @@ function appendJsonlBestEffort(filePath: string, payload: object): void {
 	}
 }
 
-function readStatusFile(asyncDir: string): AsyncStatus | null {
-	const statusPath = path.join(asyncDir, "status.json");
-	let content: string;
-	try {
-		content = fs.readFileSync(statusPath, "utf-8");
-	} catch (error) {
-		if (isNotFoundError(error)) return null;
-		throw new Error(`Failed to read async status file '${statusPath}': ${getErrorMessage(error)}`, {
-			cause: error instanceof Error ? error : undefined,
-		});
-	}
-	try {
-		return JSON.parse(content) as AsyncStatus;
-	} catch (error) {
-		throw new Error(`Failed to parse async status file '${statusPath}': ${getErrorMessage(error)}`, {
-			cause: error instanceof Error ? error : undefined,
-		});
-	}
-}
-
 interface ResultChildOutcome {
 	agent?: string;
+	sessionName?: string;
 	success?: boolean;
 	error?: string;
 	sessionFile?: string;
@@ -113,17 +101,27 @@ interface ResultChildOutcome {
 	thinking?: string;
 	attemptedModels?: string[];
 	modelAttempts?: NonNullable<AsyncStatus["steps"]>[number]["modelAttempts"];
+	contextOverflow?: boolean;
 }
 
 interface ResultRepairData {
-	state: "complete" | "failed" | "paused" | "stopped";
+	state: "complete" | "failed" | "partial" | "paused" | "stopped" | "rejected";
 	results?: ResultChildOutcome[];
+}
+
+function regularFileExists(filePath: string): boolean {
+	try {
+		return fs.statSync(filePath).isFile();
+	} catch (error) {
+		if (isNotFoundError(error)) return false;
+		throw error;
+	}
 }
 
 function readResultRepairData(resultPath: string): ResultRepairData | undefined {
 	try {
 		const data = JSON.parse(fs.readFileSync(resultPath, "utf-8")) as { success?: boolean; state?: string; exitCode?: number; results?: unknown };
-		const state = data.success ? "complete" : data.state === "stopped" ? "stopped" : data.state === "paused" || data.exitCode === 0 ? "paused" : "failed";
+		const state = data.success ? "complete" : data.state === "stopped" ? "stopped" : data.state === "rejected" ? "rejected" : data.state === "partial" ? "partial" : data.state === "paused" || data.exitCode === 0 ? "paused" : "failed";
 		const results = Array.isArray(data.results)
 			? data.results.map((entry, index) => {
 				if (!entry || typeof entry !== "object" || Array.isArray(entry)) return {};
@@ -142,7 +140,7 @@ function readResultRepairData(resultPath: string): ResultRepairData | undefined 
 	}
 }
 
-function childState(overallState: ResultRepairData["state"], child: ResultChildOutcome | undefined): "complete" | "failed" | "paused" | "stopped" {
+function childState(overallState: ResultRepairData["state"], child: ResultChildOutcome | undefined): ResultRepairData["state"] {
 	if (child?.success === true) return "complete";
 	if (child?.success === false) return "failed";
 	return overallState;
@@ -163,16 +161,18 @@ function terminalStatusFromResult(status: AsyncStatus, resultPath: string, now: 
 			endedAt: step.endedAt ?? now,
 			durationMs: step.startedAt !== undefined && step.durationMs === undefined ? Math.max(0, now - step.startedAt) : step.durationMs,
 			exitCode: step.exitCode ?? (state === "complete" || state === "paused" ? 0 : 1),
-			error: state === "failed" || state === "stopped" ? step.error ?? child?.error : step.error,
+			error: state === "failed" || state === "partial" || state === "stopped" ? step.error ?? child?.error : step.error,
 			stopped: state === "stopped" ? true : step.stopped,
+			sessionName: step.sessionName ?? child?.sessionName,
 			sessionFile: step.sessionFile ?? child?.sessionFile,
 			model,
 			thinking,
 			attemptedModels: child?.attemptedModels ?? step.attemptedModels,
 			modelAttempts: child?.modelAttempts ?? step.modelAttempts,
+			contextOverflow: child?.contextOverflow ?? step.contextOverflow,
 		};
 	});
-	return {
+	const terminalStatus: AsyncStatus = {
 		...status,
 		state: repair.state,
 		...(status.lifecycleArtifactVersion === 3 && (!status.processTerminal || status.processTerminal.state === "pending") ? {
@@ -184,6 +184,8 @@ function terminalStatusFromResult(status: AsyncStatus, resultPath: string, now: 
 		endedAt: status.endedAt ?? now,
 		steps,
 	};
+	delete terminalStatus.displayDismissedAt;
+	return terminalStatus;
 }
 
 function buildStartedStatus(asyncDir: string, startedRun: StartedRunMetadata, now: number): AsyncStatus {
@@ -196,6 +198,7 @@ function buildStartedStatus(asyncDir: string, startedRun: StartedRunMetadata, no
 	return {
 		runId: startedRun.runId || path.basename(asyncDir),
 		...(startedRun.sessionId ? { sessionId: startedRun.sessionId } : {}),
+		...(startedRun.completionOwnerId ? { completionOwnerId: startedRun.completionOwnerId } : {}),
 		mode: startedRun.mode ?? "single",
 		state: "running",
 		pid: startedRun.pid,
@@ -213,7 +216,7 @@ function buildStartedStatus(asyncDir: string, startedRun: StartedRunMetadata, no
 	};
 }
 
-function buildFailedRepair(status: AsyncStatus, asyncDir: string, now: number, reason?: string): { status: AsyncStatus; result: object; message: string } {
+function buildFailedRepair(status: AsyncStatus, asyncDir: string, now: number, reason?: string): { status: AsyncStatus; result: Record<string, unknown>; message: string } {
 	const runId = status.runId || path.basename(asyncDir);
 	const pid = typeof status.pid === "number" ? status.pid : "unknown";
 	const baseMessage = reason ?? `Async runner process ${pid} exited or disappeared before writing a result. Marked run failed by stale-run reconciliation.`;
@@ -250,17 +253,20 @@ function buildFailedRepair(status: AsyncStatus, asyncDir: string, now: number, r
 			id: runId,
 			agent: resultAgent,
 			mode: status.mode,
+			...(status.completionOwnerId ? { completionOwnerId: status.completionOwnerId } : {}),
 			success: false,
 			state: "failed",
 			summary: message,
 			results: repairedSteps.map((step) => ({
 				agent: step.agent,
+				...(step.sessionName ? { sessionName: step.sessionName } : {}),
 				output: step.status === "complete" || step.status === "completed" ? "" : message,
 				error: step.status === "complete" || step.status === "completed" ? undefined : step.error ?? message,
 				success: step.status === "complete" || step.status === "completed",
 				model: step.model,
 				attemptedModels: step.attemptedModels,
 				modelAttempts: step.modelAttempts,
+				contextOverflow: step.contextOverflow,
 				sessionFile: step.sessionFile,
 			})),
 			exitCode: 1,
@@ -275,21 +281,22 @@ function buildFailedRepair(status: AsyncStatus, asyncDir: string, now: number, r
 
 function writeFailedRepair(asyncDir: string, status: AsyncStatus, resultPath: string, now: number, reason?: string): ReconcileAsyncRunResult {
 	const repair = buildFailedRepair(status, asyncDir, now, reason);
-	writeAtomicJson(resultPath, repair.result);
+	if (repair.result.sessionId) writeAsyncResultFile(resultPath, repair.result);
 	writeAtomicJson(path.join(asyncDir, "status.json"), repair.status);
+	updateActiveRunIndex(asyncDir, repair.status.state, repair.status.toolCallId);
 	appendJsonlBestEffort(path.join(asyncDir, "events.jsonl"), {
 		type: "subagent.run.repaired_stale",
 		ts: now,
 		runId: repair.status.runId,
 		pid: status.pid,
-		resultPath,
+		...(repair.result.sessionId ? { resultPath } : {}),
 		message: repair.message,
 	});
-	return { status: repair.status, repaired: true, resultPath, message: repair.message };
+	return { status: repair.status, repaired: true, ...(repair.result.sessionId ? { resultPath } : {}), message: repair.message };
 }
 
 function terminal(state: AsyncStatus["state"]): boolean {
-	return state === "complete" || state === "failed" || state === "paused" || state === "stopped";
+	return state === "complete" || state === "failed" || state === "partial" || state === "paused" || state === "stopped" || state === "rejected";
 }
 
 function* nestedRuns(children: NestedRunSummary[] | undefined): Generator<NestedRunSummary> {
@@ -346,30 +353,39 @@ export function checkPidLiveness(pid: number, kill: KillFn = process.kill): PidL
 	}
 }
 
-export function reconcileAsyncRun(asyncDir: string, options: ReconcileAsyncRunOptions = {}): ReconcileAsyncRunResult {
+export function reconcileAsyncRun(asyncDir: string, options: ReconcileAsyncRunOptions = {}, observeStatus?: RawDrainStatusObserver): ReconcileAsyncRunResult {
 	const now = options.now?.() ?? Date.now();
-	const status = readStatusFile(asyncDir);
+	const status = readStatus(asyncDir);
+	observeStatus?.(status);
 	const startedStatus = !status && options.startedRun ? buildStartedStatus(asyncDir, options.startedRun, now) : undefined;
 	const effectiveStatus = status ?? startedStatus;
 	if (!effectiveStatus) return { status: null, repaired: false };
+	assertWorkflowGraphHostSteps(effectiveStatus.workflowGraph, path.join(asyncDir, "status.json"), effectiveStatus.runId);
 	const statusPath = path.join(asyncDir, "status.json");
 	for (const [index, step] of (effectiveStatus.steps ?? []).entries()) {
 		const stepRecord = step as Record<string, unknown>;
 		if (stepRecord.model !== undefined && typeof stepRecord.model !== "string") throw new Error(`Invalid async status file '${statusPath}': steps[${index}].model must be a string.`);
 		if (stepRecord.thinking !== undefined && typeof stepRecord.thinking !== "string") throw new Error(`Invalid async status file '${statusPath}': steps[${index}].thinking must be a string.`);
 	}
-
 	const runId = effectiveStatus.runId || path.basename(asyncDir);
-	const resultPath = path.join(options.resultsDir ?? DIRS.results, `${runId}.json`);
-	if (fs.existsSync(resultPath)) {
+	const resultsDir = options.resultsDir ?? DIRS.results;
+	const resultPath = resultFilePath(resultsDir, runId);
+	const existingResultPath = effectiveStatus.sessionId
+		? resultPayloadPathForSessionRun(resultsDir, effectiveStatus.sessionId, runId) ?? (regularFileExists(resultPath) ? resultPath : undefined)
+		: regularFileExists(resultPath) ? resultPath : undefined;
+	if (existingResultPath) {
 		const terminalStatus = effectiveStatus.state === "running" || effectiveStatus.state === "queued"
-			? terminalStatusFromResult(effectiveStatus, resultPath, now)
+			? terminalStatusFromResult(effectiveStatus, existingResultPath, now)
 			: undefined;
 		if (terminalStatus) {
 			writeAtomicJson(path.join(asyncDir, "status.json"), terminalStatus);
-			return { status: terminalStatus, repaired: true, resultPath, message: "Existing async result file was used to repair stale running status." };
+			updateActiveRunIndex(asyncDir, terminalStatus.state, terminalStatus.toolCallId);
+			return { status: terminalStatus, repaired: true, resultPath: existingResultPath, message: "Existing async result file was used to repair stale running status." };
 		}
-		return { status: effectiveStatus, repaired: false, resultPath };
+		if (effectiveStatus.displayDismissedAt === undefined) return { status: effectiveStatus, repaired: false, resultPath: existingResultPath };
+	}
+	if (effectiveStatus.displayDismissedAt !== undefined) {
+		return { status: null, repaired: false, resultPath };
 	}
 
 	if (effectiveStatus.state !== "running" || typeof effectiveStatus.pid !== "number") {

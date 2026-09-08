@@ -1,11 +1,13 @@
 import * as fs from "node:fs";
 import * as path from "node:path";
+import { createHash } from "node:crypto";
 import type { AgentToolResult } from "@earendil-works/pi-agent-core";
 import { writePrivateAtomicJson } from "../shared/atomic-json.ts";
+import { PROMPT_REDACTED } from "../shared/utils.ts";
 import type { Details, SubagentRunMode } from "../shared/types.ts";
 import { validateMissionLaunch } from "./actions.ts";
 import type { MissionArtifact, MissionRecord, MissionRunLink, MissionRunMode, MissionStatus, MissionStoreConfig, MissionStoreLocation } from "./types.ts";
-import { createMission, missionRecordPath, readMission, resolveMissionStoreLocation, updateMission, validateMissionId } from "./store.ts";
+import { createMission, MissionNotFoundError, missionRecordPath, readMission, resolveMissionStoreLocation, updateMission, validateMissionId } from "./store.ts";
 
 export const MISSION_BINDING_FILE = "mission.json";
 
@@ -34,15 +36,17 @@ interface PersistedMissionBinding {
 	retainTerminal?: number;
 }
 
-function workflowGoal(params: MissionLaunchParams): string | undefined {
-	return params.task?.trim()
+function workflowObjective(params: MissionLaunchParams): string | undefined {
+	const objective = params.task?.trim()
 		|| params.tasks?.find((task) => task.task?.trim())?.task?.trim()
 		|| params.chain?.find((step) => step.task?.trim())?.task?.trim();
-}
-
-function conciseTitle(goal: string): string {
-	const firstLine = goal.split(/\r?\n/, 1)[0]?.trim() || goal.trim();
-	return firstLine.length > 100 ? `${firstLine.slice(0, 97)}...` : firstLine;
+	if (objective) return objective;
+	for (const step of params.chain ?? []) {
+		const parallel = Array.isArray(step.parallel) ? step.parallel : step.parallel ? [step.parallel] : [];
+		const task = parallel.find((child) => child.task?.trim())?.task?.trim();
+		if (task) return task;
+	}
+	return undefined;
 }
 
 export function prepareMissionLaunch(input: {
@@ -51,24 +55,28 @@ export function prepareMissionLaunch(input: {
 	config?: MissionStoreConfig;
 	ownerSessionId?: string;
 }): MissionLaunchBinding | undefined {
-	if (input.params.missionId && input.params.mission !== undefined) throw new Error("Use missionId or mission, not both");
+	const hasMissionId = input.params.missionId !== undefined;
+	if (hasMissionId && input.params.mission !== undefined) throw new Error("Use missionId or mission, not both");
 	if (input.params.mission === false) return undefined;
-	const goal = workflowGoal(input.params);
+	const objective = workflowObjective(input.params);
 	const missionsEnabled = input.config?.enabled !== false;
-	const shouldCreate = input.params.mission !== undefined || (missionsEnabled && goal !== undefined);
-	if (!input.params.missionId && !shouldCreate) return undefined;
+	const shouldCreate = input.params.mission !== undefined || (missionsEnabled && objective !== undefined);
+	if (!hasMissionId && !shouldCreate) return undefined;
 	const location = resolveMissionStoreLocation({ projectRoot: input.projectRoot, ...(input.config ? { config: input.config } : {}) });
-	if (input.params.missionId) {
+	if (hasMissionId) {
 		const missionId = validateMissionId(input.params.missionId);
 		readMission(location, missionId);
 		updateMission(location, missionId, { status: "active" });
 		return { missionId, location, autoCreated: false, announceInContent: true };
 	}
 	const mission = input.params.mission !== undefined ? validateMissionLaunch(input.params.mission) : undefined;
-	const title = mission?.title || conciseTitle(goal!);
+	const promptDerivedObjective = mission?.objective ?? (mission ? mission.title : objective ? PROMPT_REDACTED : undefined);
+	const title = mission?.title || PROMPT_REDACTED;
 	const record = createMission(location, {
 		title,
-		goal: mission?.goal || goal || title,
+		objective: promptDerivedObjective || title,
+		...(mission?.goal === true ? { goal: true as const } : {}),
+		...(mission?.budget ? { budget: mission.budget } : {}),
 		status: "active",
 		...(mission?.labels ? { labels: mission.labels } : {}),
 		...(input.ownerSessionId ? { ownerSessionId: input.ownerSessionId } : {}),
@@ -92,13 +100,26 @@ function runStatusForResult(result: AgentToolResult<Details>): string {
 }
 
 function missionStatusForRun(record: MissionRecord, runId: string, runStatus: string): MissionStatus {
+	if (record.status === "completed" || record.status === "failed" || record.status === "cancelled") return record.status;
 	if (runStatus === "active" || runStatus === "queued" || runStatus === "running") return "active";
+	if (record.goal) return "active";
 	if (runStatus === "paused") return "waiting";
 	const otherActive = record.runs.some((run) => run.runId !== runId && (run.status === "active" || run.status === "queued" || run.status === "running"));
 	if (otherActive) return "active";
 	if (runStatus === "completed" || runStatus === "complete") return "completed";
 	if (runStatus === "stopped" || runStatus === "rejected" || runStatus === "cancelled") return "cancelled";
 	return "failed";
+}
+
+function usageForResult(result: AgentToolResult<Details>): { tokens: number } | undefined {
+	const tokens = result.details.results.reduce((total, child) => total + child.usage.input + child.usage.output, 0);
+	return tokens > 0 ? { tokens } : undefined;
+}
+
+function usageFromUnknown(value: unknown): { tokens: number } | undefined {
+	if (!value || typeof value !== "object" || Array.isArray(value)) return undefined;
+	const total = (value as { total?: unknown }).total;
+	return Number.isSafeInteger(total) && (total as number) >= 0 ? { tokens: total as number } : undefined;
 }
 
 function artifactsForResult(result: AgentToolResult<Details>): MissionArtifact[] {
@@ -137,7 +158,7 @@ function persistedBinding(binding: MissionLaunchBinding): PersistedMissionBindin
 	};
 }
 
-function writeAsyncBinding(asyncDir: string, binding: MissionLaunchBinding): void {
+export function writeMissionAsyncBinding(asyncDir: string, binding: MissionLaunchBinding): void {
 	writePrivateAtomicJson(path.join(asyncDir, MISSION_BINDING_FILE), persistedBinding(binding));
 }
 
@@ -168,6 +189,7 @@ export function attachMissionToLaunchResult(input: {
 	const runStatus = runStatusForResult(input.result);
 	const current = readMission(input.binding.location, input.binding.missionId);
 	const startedAt = new Date().toISOString();
+	const usage = usageForResult(input.result);
 	const run: MissionRunLink = {
 		runId,
 		mode: missionRunModeForResult(input.result.details.mode),
@@ -176,6 +198,7 @@ export function attachMissionToLaunchResult(input: {
 		...(input.result.details.asyncDir ? { asyncDir: input.result.details.asyncDir } : {}),
 		...(input.result.details.results.length === 1 && input.result.details.results[0]?.agent ? { agent: input.result.details.results[0].agent } : {}),
 		...(runStatus !== "active" ? { completedAt: startedAt } : {}),
+		...(usage ? { usage } : {}),
 	};
 	let mission = updateMission(input.binding.location, input.binding.missionId, {
 		status: missionStatusForRun(current, runId, runStatus),
@@ -185,7 +208,7 @@ export function attachMissionToLaunchResult(input: {
 		...(input.result.details.results.length === 1 && input.result.details.results[0]?.acceptance ? { acceptance: input.result.details.results[0].acceptance } : {}),
 	});
 	if (input.result.details.asyncDir) {
-		writeAsyncBinding(input.result.details.asyncDir, input.binding);
+		writeMissionAsyncBinding(input.result.details.asyncDir, input.binding);
 		const statusPath = path.join(input.result.details.asyncDir, "status.json");
 		if (fs.existsSync(statusPath)) {
 			try {
@@ -267,7 +290,29 @@ export function syncMissionFromAsyncCompletion(value: unknown): MissionRecord | 
 	const runId = typeof event.runId === "string" ? event.runId : typeof event.id === "string" ? event.id : undefined;
 	if (!runId) throw new Error("Async mission completion is missing runId");
 	const runStatus = typeof event.state === "string" ? event.state : event.success === true ? "completed" : "failed";
-	const current = readMission(binding.location, binding.missionId);
+	let current: MissionRecord;
+	try {
+		current = readMission(binding.location, binding.missionId);
+	} catch (error) {
+		if (!(error instanceof MissionNotFoundError)) throw error;
+		const reason = "mission-record-missing";
+		const markerId = createHash("sha256").update(JSON.stringify([runId, binding.missionId, reason])).digest("hex");
+		const markerPath = path.join(event.asyncDir, `.mission-sync-skipped-${markerId}.json`);
+		try {
+			fs.writeFileSync(markerPath, `${JSON.stringify({ runId, missionId: binding.missionId, reason })}\n`, { encoding: "utf-8", mode: 0o600, flag: "wx" });
+			fs.appendFileSync(path.join(event.asyncDir, "events.jsonl"), `${JSON.stringify({
+				type: "subagent.mission.sync.skipped",
+				ts: Date.now(),
+				runId,
+				missionId: binding.missionId,
+				reason,
+				missionPath: missionRecordPath(binding.location, binding.missionId),
+			})}\n`, "utf-8");
+		} catch {
+			// Mission bookkeeping is secondary to preserving the completed async result.
+		}
+		return undefined;
+	}
 	const completedAt = new Date().toISOString();
 	const artifacts: MissionArtifact[] = [
 		{ kind: "status", path: path.join(event.asyncDir, "status.json") },
@@ -287,10 +332,36 @@ export function syncMissionFromAsyncCompletion(value: unknown): MissionRecord | 
 		}
 	}
 	const summary = typeof event.summary === "string" && event.summary.trim() ? event.summary.slice(0, 2000) : undefined;
+	const usage = usageFromUnknown(event.totalTokens)
+		?? (Array.isArray(event.results)
+			? { tokens: event.results.reduce((total, result) => {
+				if (!result || typeof result !== "object") return total;
+				return total + (usageFromUnknown((result as { tokens?: unknown }).tokens)?.tokens ?? 0);
+			}, 0) }
+			: undefined);
+	const workflowRunId = typeof event.parentWorkflowRunId === "string" && event.parentWorkflowRunId.trim() ? event.parentWorkflowRunId.trim() : undefined;
+	const workflowKey = typeof event.workflowKey === "string" && event.workflowKey.trim() ? event.workflowKey.trim() : undefined;
+	const workflowChildStatus = runStatus === "complete" || runStatus === "completed" || event.success === true
+		? "completed"
+		: runStatus === "paused"
+			? "paused"
+			: runStatus === "stopped"
+				? "stopped"
+				: "failed";
+	const workflowChildTerminal = !["running", "queued", "active", "paused"].includes(workflowChildStatus);
 	return updateMission(binding.location, binding.missionId, {
 		status: missionStatusForRun(current, runId, runStatus),
-		addRuns: [{ runId, mode: typeof event.mode === "string" && ["single", "parallel", "chain"].includes(event.mode) ? event.mode as SubagentRunMode : "external", asyncDir: event.asyncDir, status: runStatus, completedAt }],
+		addRuns: [{ runId, mode: typeof event.mode === "string" && ["single", "parallel", "chain", "workflow"].includes(event.mode) ? event.mode as SubagentRunMode : "external", asyncDir: event.asyncDir, status: runStatus, completedAt, ...(usage && usage.tokens > 0 ? { usage } : {}) }],
 		addArtifacts: artifacts,
+		...(workflowRunId && workflowKey ? { upsertWorkflowChildren: [{
+			workflowRunId,
+			key: workflowKey,
+			runId,
+			status: workflowChildStatus,
+			artifactPaths: artifacts.map((artifact) => artifact.path),
+			...(workflowChildTerminal ? { completedAt } : {}),
+			heartbeat: { status: workflowChildStatus, ...(summary ? { message: summary } : {}) },
+		}] } : {}),
 		...(summary ? { summary } : {}),
 	});
 }

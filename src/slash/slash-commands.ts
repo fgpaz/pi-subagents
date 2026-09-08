@@ -2,8 +2,10 @@ import { randomUUID } from "node:crypto";
 import * as fs from "node:fs";
 import * as path from "node:path";
 import { keyText, type ExtensionAPI, type ExtensionContext } from "@earendil-works/pi-coding-agent";
-import { Key, matchesKey, type Component, type TUI } from "@earendil-works/pi-tui";
-import { BUILTIN_AGENT_NAMES, discoverAgents } from "../agents/agents.ts";
+import { Key, matchesKey, truncateToWidth, type Component, type KeyId, type TUI } from "@earendil-works/pi-tui";
+import { discoverAgentSnapshot, discoverAgents, findBlockingAgentDiagnostic, formatUnknownAgentError, resolveAgentName, unknownAgentDiagnosticContext, type AgentConfig, type AgentDiscoveryDiagnostic, type AgentScope, type UnknownAgentDiagnosticContext } from "../agents/agents.ts";
+import { listRuntimeAgentConfigs, mergeRuntimeAgents } from "../agents/runtime-agent-registry.ts";
+import { resolveExistingReadPaths } from "../shared/settings.ts";
 import {
 	DEFAULT_PROVIDER_MODELS_MAX_AGE_DAYS,
 	applySubagentProfile,
@@ -17,11 +19,17 @@ import type { SubagentParamsLike } from "../runs/foreground/subagent-executor.ts
 import { findModelInfo, toModelInfo } from "../shared/model-info.ts";
 import { formatTokens, shortenPath } from "../shared/formatters.ts";
 import { listAsyncRuns, formatAsyncRunProgressLabel, type AsyncRunSummary } from "../runs/background/async-status.ts";
-import { scheduledRunStorePath } from "../runs/background/scheduled-runs.ts";
-import { SUBAGENT_FANOUT_CHILD_ENV } from "../runs/shared/pi-args.ts";
+import { encodeInspectReply, handleInspectRpcArgs, INSPECT_WIDGET_KEY } from "../runs/background/inspect-rpc.ts";
+import { listScheduledRunSummaries } from "../runs/background/scheduled-runs.ts";
+import { resolveAsyncStatusChild } from "../runs/shared/child-identity.ts";
+import { readStatus } from "../shared/utils.ts";
+import { getArtifactPaths, getArtifactsDir } from "../shared/artifacts.ts";
+import { readWorkflowReceipt } from "../workflows/workflow-receipt.ts";
+import { FLEET_OPEN_SHORTCUT } from "../shared/shortcuts.ts";
 import type { SlashSubagentResponse, SlashSubagentUpdate } from "./slash-bridge.ts";
 import { registerPromptWorkflowCommands } from "./prompt-workflows.ts";
 import { openSubagentsAdmin } from "./subagents-admin.ts";
+import { SUBAGENT_GUIDE_TOPICS } from "../extension/subagent-guide.ts";
 import { openSubagentFleet } from "../tui/fleet.ts";
 import {
 	applySlashUpdate,
@@ -40,7 +48,7 @@ import {
 	SLASH_SUBAGENT_UPDATE_EVENT,
 	DIRS,
 	type Details,
-	type JsonSchemaObject,
+	type FleetKeybindingsConfig,
 	type SingleResult,
 	type SubagentState,
 	type Usage,
@@ -103,18 +111,29 @@ const extractExecutionFlags = (rawArgs: string): { args: string; bg: boolean; fo
 	return { args, bg, fork };
 };
 
-const makeAgentCompletions = (state: SubagentState) => (prefix: string) => {
+function discoverSlashAgents(pi: ExtensionAPI, cwd: string, scope: AgentScope): { agents: AgentConfig[]; agentDiagnostics?: AgentDiscoveryDiagnostic[]; unknownAgentDiagnosticContext: UnknownAgentDiagnosticContext } {
+	if (listRuntimeAgentConfigs(pi).length === 0) {
+		const discovered = discoverAgents(cwd, scope);
+		return { ...discovered, unknownAgentDiagnosticContext: unknownAgentDiagnosticContext(discovered) };
+	}
+	const snapshot = discoverAgentSnapshot(cwd, scope, undefined, { includeChains: false });
+	const discovered = snapshot.effective;
+	const all = snapshot.all;
+	const configuredAgents: AgentConfig[] = [
+		...all.builtin,
+		...all.package,
+		...(scope !== "project" ? all.user : []),
+		...(scope !== "user" ? all.project : []),
+	];
+	const merged = mergeRuntimeAgents(pi, discovered, configuredAgents);
+	return { ...merged, unknownAgentDiagnosticContext: { ...unknownAgentDiagnosticContext(discovered), agents: merged.agents } };
+}
+
+const makeAgentCompletions = (pi: ExtensionAPI, state: SubagentState) => (prefix: string) => {
 	if (!state.baseCwd || prefix.includes(" ")) return null;
-	return discoverAgents(state.baseCwd, "both").agents
+	return discoverSlashAgents(pi, state.baseCwd, "both").agents
 		.filter((agent) => agent.name.startsWith(prefix))
 		.map((agent) => ({ value: agent.name, label: agent.name }));
-};
-
-const makeBuiltinAgentNameCompletions = () => (prefix: string) => {
-	if (prefix.includes(" ")) return null;
-	return BUILTIN_AGENT_NAMES
-		.filter((name) => name.startsWith(prefix))
-		.map((name) => ({ value: name, label: name }));
 };
 
 const makeProviderCompletions = (state: SubagentState) => (prefix: string) => {
@@ -161,7 +180,7 @@ type StopSelectorResult = { confirmed: boolean; target?: StopSelectorTarget };
 
 function commandForTarget(target: StopSelectorTarget): string {
 	return target.kind === "scheduled"
-		? `subagent({ action: "schedule-cancel", id: ${JSON.stringify(target.id)} })`
+		? `subagent({ action: "schedule.pause", id: ${JSON.stringify(target.id)} })`
 		: `subagent({ action: "stop", id: ${JSON.stringify(target.id)} })`;
 }
 
@@ -177,30 +196,21 @@ function formatAsyncStopTarget(run: AsyncRunSummary): StopSelectorTarget {
 	};
 }
 
-function scheduledStopTargets(ctx: ExtensionContext, state: SubagentState): StopSelectorTarget[] {
-	const sessionId = state.currentSessionId ?? ctx.sessionManager.getSessionId();
-	if (!sessionId) return [];
-	const storePath = scheduledRunStorePath(ctx.cwd, sessionId);
-	if (!fs.existsSync(storePath)) return [];
-	let parsed: unknown;
+function scheduledStopTargets(ctx: ExtensionContext, _state: SubagentState): StopSelectorTarget[] {
 	try {
-		parsed = JSON.parse(fs.readFileSync(storePath, "utf-8"));
+		return listScheduledRunSummaries(ctx.cwd)
+			.filter((schedule) => !schedule.paused && !schedule.activeRunId && schedule.trigger.nextRunAt)
+			.sort((left, right) => left.trigger.nextRunAt!.localeCompare(right.trigger.nextRunAt!))
+			.map((schedule) => ({
+				kind: "scheduled" as const,
+				id: schedule.id,
+				label: `${schedule.id} · ${schedule.name}`,
+				detail: `scheduled · ${schedule.trigger.nextRunAt}`,
+				actionLabel: "pause schedule",
+			}));
 	} catch {
 		return [];
 	}
-	const jobs = parsed && typeof parsed === "object" && Array.isArray((parsed as { jobs?: unknown }).jobs)
-		? (parsed as { jobs: Array<Record<string, unknown>> }).jobs
-		: [];
-	return jobs
-		.filter((job) => job.state === "scheduled" && typeof job.id === "string" && typeof job.name === "string" && typeof job.runAt === "number")
-		.sort((left, right) => Number(left.runAt) - Number(right.runAt))
-		.map((job) => ({
-			kind: "scheduled" as const,
-			id: String(job.id),
-			label: `${String(job.id)} · ${String(job.name)}`,
-			detail: `scheduled · ${new Date(Number(job.runAt)).toISOString()}`,
-			actionLabel: "cancel scheduled run",
-		}));
 }
 
 function discoverStopTargets(ctx: ExtensionContext, state: SubagentState): StopSelectorTarget[] {
@@ -290,7 +300,7 @@ class SubagentsStopSelector implements Component {
 	invalidate(): void {}
 
 	render(width: number): string[] {
-		const contentWidth = Math.max(40, Math.min(this.width, width || this.width));
+		const contentWidth = Math.max(0, Math.min(this.width, Math.floor(width)));
 		const lines = [this.theme.bold("Stop subagent run"), this.theme.fg("dim", "Select a current-session async run to stop, or a scheduled run to cancel."), ""];
 		const maxRows = 10;
 		const start = Math.max(0, Math.min(this.selected - maxRows + 1, Math.max(0, this.targets.length - maxRows)));
@@ -314,7 +324,7 @@ class SubagentsStopSelector implements Component {
 		} else {
 			lines.push(this.theme.fg("dim", "↑↓/jk select · Enter confirm · Esc cancel"));
 		}
-		return lines;
+		return lines.map((line) => truncateToWidth(line, contentWidth));
 	}
 }
 
@@ -335,25 +345,60 @@ function usageHasValue(usage: Usage): boolean {
 	return usage.input !== 0 || usage.output !== 0 || usage.cacheRead !== 0 || usage.cacheWrite !== 0 || usage.cost !== 0 || usage.turns !== 0;
 }
 
+function nonNegativeNumber(value: unknown): number | undefined {
+	return typeof value === "number" && Number.isFinite(value) && value >= 0 ? value : undefined;
+}
+
+function usageFromValue(value: unknown, turnsOverride?: number): Usage | undefined {
+	if (!value || typeof value !== "object" || Array.isArray(value)) return undefined;
+	const record = value as Record<string, unknown>;
+	const costValue = typeof record.cost === "object" && record.cost !== null && !Array.isArray(record.cost)
+		? (record.cost as Record<string, unknown>).total
+		: record.cost;
+	const turnsValue = turnsOverride ?? record.turns;
+	const usage = {
+		input: nonNegativeNumber(record.input) ?? 0,
+		output: nonNegativeNumber(record.output) ?? 0,
+		cacheRead: nonNegativeNumber(record.cacheRead) ?? 0,
+		cacheWrite: nonNegativeNumber(record.cacheWrite) ?? 0,
+		cost: nonNegativeNumber(costValue) ?? 0,
+		turns: nonNegativeNumber(turnsValue) ?? 0,
+	};
+	return Number.isSafeInteger(usage.turns) ? usage : undefined;
+}
+
 function assistantUsageFromMessage(message: unknown): Usage | undefined {
 	if (!message || typeof message !== "object") return undefined;
 	const msg = message as { role?: unknown; usage?: unknown };
-	if (msg.role !== "assistant" || !msg.usage || typeof msg.usage !== "object") return undefined;
-	const usage = msg.usage as {
-		input?: unknown;
-		output?: unknown;
-		cacheRead?: unknown;
-		cacheWrite?: unknown;
-		cost?: { total?: unknown };
-	};
-	return {
-		input: typeof usage.input === "number" ? usage.input : 0,
-		output: typeof usage.output === "number" ? usage.output : 0,
-		cacheRead: typeof usage.cacheRead === "number" ? usage.cacheRead : 0,
-		cacheWrite: typeof usage.cacheWrite === "number" ? usage.cacheWrite : 0,
-		cost: typeof usage.cost?.total === "number" ? usage.cost.total : 0,
-		turns: 1,
-	};
+	return msg.role === "assistant" ? usageFromValue(msg.usage, 1) : undefined;
+}
+
+function compactionUsageFromEntry(entry: unknown): Usage | undefined {
+	if (!entry || typeof entry !== "object") return undefined;
+	const record = entry as { type?: unknown; usage?: unknown };
+	return record.type === "compaction" ? usageFromValue(record.usage, 0) : undefined;
+}
+
+const MAX_USAGE_METADATA_BYTES = 2 * 1024 * 1024;
+
+function readUsageMetadata(metadataPath: string): Record<string, unknown> | undefined {
+	let fd: number | undefined;
+	try {
+		fd = fs.openSync(metadataPath, "r");
+		const stat = fs.fstatSync(fd);
+		if (!stat.isFile() || stat.size > MAX_USAGE_METADATA_BYTES) return undefined;
+		const buffer = Buffer.allocUnsafe(stat.size);
+		let offset = 0;
+		while (offset < buffer.length) {
+			const bytesRead = fs.readSync(fd, buffer, offset, buffer.length - offset, null);
+			if (bytesRead <= 0) return undefined;
+			offset += bytesRead;
+		}
+		const value: unknown = JSON.parse(buffer.toString("utf-8"));
+		return value && typeof value === "object" && !Array.isArray(value) ? value as Record<string, unknown> : undefined;
+	} finally {
+		if (fd !== undefined) fs.closeSync(fd);
+	}
 }
 
 function isSubagentDetails(value: unknown): value is Details {
@@ -371,8 +416,30 @@ function detailsFromSessionEntry(entry: unknown): Details | undefined {
 	}
 	if (record.type !== "message" || !record.message || typeof record.message !== "object") return undefined;
 	const message = record.message as { role?: unknown; toolName?: unknown; details?: unknown };
-	if (message.role !== "toolResult" || message.toolName !== "subagent") return undefined;
+	if (message.role !== "toolResult" || (message.toolName !== "subagent" && message.toolName !== "bg_wait")) return undefined;
 	return isSubagentDetails(message.details) ? message.details : undefined;
+}
+
+function metadataUsage(
+	artifactsDirs: string[],
+	input: { runId: string; agent: string },
+): Usage | undefined {
+	if (!/^[A-Za-z0-9._-]+$/.test(input.runId)) return undefined;
+	for (const artifactsDir of artifactsDirs) {
+		for (const index of [0, undefined] as const) {
+			const metadataPath = getArtifactPaths(artifactsDir, input.runId, input.agent, index).metadataPath;
+			try {
+				const metadata = readUsageMetadata(metadataPath);
+				if (!metadata) continue;
+				if (metadata.runId !== input.runId || metadata.agent !== input.agent) continue;
+				const usage = usageFromValue(metadata.usage);
+				if (usage && usageHasValue(usage)) return usage;
+			} catch (error) {
+				if ((error as NodeJS.ErrnoException).code !== "ENOENT") console.error(`Failed to read subagent usage metadata '${metadataPath}':`, error);
+			}
+		}
+	}
+	return undefined;
 }
 
 function formatCostUsage(label: string, usage: Usage): string {
@@ -384,28 +451,94 @@ function formatCostUsage(label: string, usage: Usage): string {
 	return `${label}: ↑${formatTokens(usage.input)} ↓${formatTokens(usage.output)} $${usage.cost.toFixed(4)}${extras.length ? ` (${extras.join(", ")})` : ""}`;
 }
 
-function buildSubagentCostReport(ctx: ExtensionContext): string {
+function buildSubagentCostReport(ctx: ExtensionContext, state: SubagentState): string {
 	const parent = emptyUsage();
 	const childTotal = emptyUsage();
 	const total = emptyUsage();
 	const children: Array<{ label: string; usage: Usage; sessionFile?: string }> = [];
+	const seenChildren = new Set<string>();
+	const workflowRunIds = new Set<string>();
+	let unresolvedAsyncChildren = 0;
+
+	const addChild = (input: { agent?: string; runId?: string; usage?: Usage; sessionFile?: string }): boolean => {
+		if (!input.usage || !usageHasValue(input.usage)) return false;
+		const identity = input.runId ? `run:${input.runId}` : input.sessionFile ? `session:${input.sessionFile}` : undefined;
+		if (identity && seenChildren.has(identity)) return true;
+		if (identity) seenChildren.add(identity);
+		const usage = { ...input.usage };
+		children.push({
+			label: `Child ${children.length + 1} (${input.agent ?? "unknown"})`,
+			usage,
+			...(input.sessionFile ? { sessionFile: input.sessionFile } : {}),
+		});
+		addUsage(childTotal, usage);
+		return true;
+	};
+
 	for (const entry of ctx.sessionManager.getBranch()) {
 		const message = entry.type === "message" ? (entry as { message?: unknown }).message : undefined;
-		const parentUsage = assistantUsageFromMessage(message);
+		const parentUsage = assistantUsageFromMessage(message) ?? compactionUsageFromEntry(entry);
 		if (parentUsage) addUsage(parent, parentUsage);
 		const details = detailsFromSessionEntry(entry);
 		if (!details) continue;
+		if (details.mode === "workflow" && details.runId) workflowRunIds.add(details.runId);
 		for (const result of details.results) {
-			if (!usageHasValue(result.usage)) continue;
-			const usage = { ...result.usage };
-			children.push({
-				label: `Child ${children.length + 1} (${result.agent})`,
-				usage,
-				...(result.sessionFile ? { sessionFile: result.sessionFile } : {}),
-			});
-			addUsage(childTotal, usage);
+			const resultRunId = (result as SingleResult & { runId?: unknown }).runId;
+			addChild({ agent: result.agent, runId: typeof resultRunId === "string" ? resultRunId : undefined, usage: usageFromValue(result.usage), sessionFile: result.sessionFile });
+		}
+		for (const completion of details.completions ?? []) {
+			if (completion.mode === "workflow") workflowRunIds.add(completion.runId);
+			for (const result of completion.results ?? []) {
+				addChild({ agent: result.agent, runId: result.runId, usage: usageFromValue(result.usage), sessionFile: result.sessionFile });
+			}
 		}
 	}
+
+	let sessionFile: string | null = null;
+	try {
+		sessionFile = ctx.sessionManager.getSessionFile() ?? null;
+	} catch { /* an unpersisted session can still report direct child usage */ }
+	const artifactsDirs = new Set<string>();
+	const addArtifactsDir = (cwd: string | undefined): void => {
+		try {
+			artifactsDirs.add(getArtifactsDir(sessionFile, cwd, state.artifactDirPreference));
+		} catch { /* invalid or unavailable project roots are ignored */ }
+	};
+	addArtifactsDir(ctx.cwd);
+	addArtifactsDir(state.baseCwd);
+
+	for (const workflowRunId of workflowRunIds) {
+		try {
+			const status = readStatus(path.join(DIRS.async, workflowRunId));
+			addArtifactsDir(status?.cwd);
+			const receipt = readWorkflowReceipt(DIRS.async, workflowRunId);
+			const summaryChildren = new Map((receipt.workflowChildren?.children ?? []).map((child) => [child.childId, child]));
+			const refsByRunId = new Map<string, { runId: string; agent: string }>();
+			const addRef = (runId: string | undefined, agent: string | undefined): void => {
+				if (!runId || !agent || refsByRunId.has(runId)) return;
+				refsByRunId.set(runId, { runId, agent });
+			};
+			for (const [key, entry] of Object.entries(receipt.entries)) {
+				const summaryChild = summaryChildren.get(key);
+				const runIds = entry.continuation?.runIds?.length
+					? entry.continuation.runIds
+					: entry.latestRunId ? [entry.latestRunId] : summaryChild?.runId ? [summaryChild.runId] : [];
+				for (const runId of runIds) addRef(runId, entry.agent ?? summaryChild?.agent);
+			}
+			for (const child of receipt.workflowChildren?.children ?? []) {
+				if (!Object.hasOwn(receipt.entries, child.childId)) addRef(child.runId, child.agent);
+			}
+			const refs = [...refsByRunId.values()];
+			for (const ref of refs) {
+				if (seenChildren.has(`run:${ref.runId}`)) continue;
+				const usage = metadataUsage([...artifactsDirs], ref);
+				if (!usage || !addChild({ ...ref, usage })) unresolvedAsyncChildren += 1;
+			}
+		} catch (error) {
+			if ((error as NodeJS.ErrnoException).code !== "ENOENT") console.error(`Failed to resolve async subagent usage for '${workflowRunId}':`, error);
+		}
+	}
+
 	addUsage(total, parent);
 	addUsage(total, childTotal);
 	const lines = [
@@ -421,6 +554,7 @@ function buildSubagentCostReport(ctx: ExtensionContext): string {
 			if (child.sessionFile) lines.push(`  Session: ${child.sessionFile}`);
 		}
 	}
+	if (unresolvedAsyncChildren > 0) lines.push(`Async child usage unavailable: ${unresolvedAsyncChildren}.`);
 	lines.push("────────────────────────────", formatCostUsage("Children", childTotal), formatCostUsage("Total", total));
 	return lines.join("\n");
 }
@@ -436,50 +570,76 @@ function getProfileWorkerModel(profile: { subagents?: { agentOverrides?: Record<
 	return typeof model === "string" && model.trim() ? model.trim() : undefined;
 }
 
+function isStaleExtensionContextError(error: unknown): boolean {
+	return error instanceof Error
+		&& (error.message.includes("This extension ctx is stale")
+			|| error.message.includes("Extension context no longer active"));
+}
+
+function slashHasUI(ctx: ExtensionContext): boolean | undefined {
+	try {
+		return ctx.hasUI;
+	} catch (error) {
+		if (isStaleExtensionContextError(error)) return undefined;
+		throw error;
+	}
+}
+
 
 async function requestSlashRun(
 	pi: ExtensionAPI,
 	ctx: ExtensionContext,
 	requestId: string,
 	params: SubagentParamsLike,
+	signal?: AbortSignal,
 ): Promise<SlashSubagentResponse> {
 	return new Promise((resolve, reject) => {
 		let done = false;
 		let started = false;
-
-		const startTimeoutMs = 15_000;
-		const startTimeout = setTimeout(() => {
-			finish(() => reject(new Error(
-				"Slash subagent bridge did not start within 15s. Ensure the extension is loaded correctly.",
-			)));
-		}, startTimeoutMs);
+		let startTimeout: ReturnType<typeof setTimeout> | undefined;
 
 		const onStarted = (data: unknown) => {
-			if (done || !data || typeof data !== "object") return;
+			if (done || signal?.aborted || !data || typeof data !== "object") return;
 			if ((data as { requestId?: unknown }).requestId !== requestId) return;
 			started = true;
-			clearTimeout(startTimeout);
-			if (ctx.hasUI) ctx.ui.setStatus("subagent-slash", "running...");
+			if (startTimeout) clearTimeout(startTimeout);
+			try {
+				if (ctx.hasUI) ctx.ui.setStatus("subagent-slash", "running...");
+			} catch (error) {
+				if (isStaleExtensionContextError(error)) {
+					finish(() => reject(error));
+					return;
+				}
+				throw error;
+			}
 		};
 
 		const onResponse = (data: unknown) => {
-			if (done || !data || typeof data !== "object") return;
+			if (done || signal?.aborted || !data || typeof data !== "object") return;
 			const response = data as Partial<SlashSubagentResponse>;
 			if (response.requestId !== requestId) return;
-			clearTimeout(startTimeout);
+			if (startTimeout) clearTimeout(startTimeout);
 			finish(() => resolve(response as SlashSubagentResponse));
 		};
 
 		const onUpdate = (data: unknown) => {
-			if (done || !data || typeof data !== "object") return;
+			if (done || signal?.aborted || !data || typeof data !== "object") return;
 			const update = data as SlashSubagentUpdate;
 			if (update.requestId !== requestId) return;
 			applySlashUpdate(requestId, update);
-			if (!ctx.hasUI) return;
-			const tool = update.currentTool ? ` ${update.currentTool}` : "";
-			const count = update.toolCount ?? 0;
-			const liveDetailKey = keyText("app.tools.expand");
-			ctx.ui.setStatus("subagent-slash", `${count} tools${tool} | ${liveDetailKey} live detail`);
+			try {
+				if (!ctx.hasUI) return;
+				const tool = update.currentTool ? ` ${update.currentTool}` : "";
+				const count = update.toolCount ?? 0;
+				const liveDetailKey = keyText("app.tools.expand");
+				ctx.ui.setStatus("subagent-slash", `${count} tools${tool} | ${liveDetailKey} live detail`);
+			} catch (error) {
+				if (isStaleExtensionContextError(error)) {
+					finish(() => reject(error));
+					return;
+				}
+				throw error;
+			}
 		};
 
 		const onTerminalInput = ctx.hasUI
@@ -495,18 +655,43 @@ async function requestSlashRun(
 		const unsubResponse = pi.events.on(SLASH_SUBAGENT_RESPONSE_EVENT, onResponse);
 		const unsubUpdate = pi.events.on(SLASH_SUBAGENT_UPDATE_EVENT, onUpdate);
 
+		let onAbort: () => void;
 		const finish = (next: () => void) => {
 			if (done) return;
 			done = true;
-			clearTimeout(startTimeout);
+			if (startTimeout) clearTimeout(startTimeout);
 			unsubStarted();
 			unsubResponse();
 			unsubUpdate();
-			onTerminalInput?.();
+			try {
+				onTerminalInput?.();
+			} catch (error) {
+				if (!isStaleExtensionContextError(error)) throw error;
+			}
+			signal?.removeEventListener("abort", onAbort);
 			next();
 		};
+		onAbort = () => finish(() => reject(new Error("Slash subagent request canceled during session replacement or reload.")));
+		startTimeout = setTimeout(() => {
+			finish(() => reject(new Error(
+				"Slash subagent bridge did not start within 15s. Ensure the extension is loaded correctly.",
+			)));
+		}, 15_000);
 
-		pi.events.emit(SLASH_SUBAGENT_REQUEST_EVENT, { requestId, params, ctx });
+		if (signal?.aborted) {
+			onAbort();
+			return;
+		}
+		signal?.addEventListener("abort", onAbort, { once: true });
+		try {
+			pi.events.emit(SLASH_SUBAGENT_REQUEST_EVENT, { requestId, params, ctx });
+		} catch (error) {
+			if (isStaleExtensionContextError(error)) {
+				finish(() => reject(error));
+				return;
+			}
+			throw error;
+		}
 
 		// Bridge emits STARTED synchronously during REQUEST emit.
 		// If not started, no bridge received the request.
@@ -572,74 +757,101 @@ async function runSlashSubagent(
 	pi: ExtensionAPI,
 	ctx: ExtensionContext,
 	params: SubagentParamsLike,
+	signal?: AbortSignal,
 ): Promise<void> {
-	if (ctx.hasUI) ctx.ui.setToolsExpanded(false);
+	if (signal?.aborted) return;
+	const initialHasUI = slashHasUI(ctx);
+	if (initialHasUI === undefined) return;
+	try {
+		if (initialHasUI) ctx.ui.setToolsExpanded(false);
+	} catch (error) {
+		if (isStaleExtensionContextError(error)) return;
+		throw error;
+	}
 	const requestId = randomUUID();
 	const initialDetails = buildSlashInitialResult(requestId, params);
 	const initialText = extractSlashMessageText(initialDetails.result.content) || "Running subagent...";
-	pi.sendMessage({
-		customType: SLASH_RESULT_TYPE,
-		content: initialText,
-		display: true,
-		details: initialDetails,
-	});
+	try {
+		pi.sendMessage({
+			customType: SLASH_RESULT_TYPE,
+			content: initialText,
+			display: true,
+			details: initialDetails,
+		});
+	} catch (error) {
+		if (isStaleExtensionContextError(error)) return;
+		throw error;
+	}
 	persistSlashSessionSnapshot(ctx);
 
 	try {
-		const response = await requestSlashRun(pi, ctx, requestId, params);
+		const response = await requestSlashRun(pi, ctx, requestId, params, signal);
+		if (signal?.aborted) return;
+		const hasUI = slashHasUI(ctx);
+		if (hasUI === undefined) return;
 		const finalDetails = finalizeSlashResult(response);
 		pi.sendMessage({
 			customType: SLASH_RESULT_TYPE,
 			content: buildSlashExportText(response),
-			display: !ctx.hasUI,
+			display: !hasUI,
 			details: finalDetails,
 		});
 		persistSlashSessionSnapshot(ctx);
-		if (ctx.hasUI) {
+		if (hasUI) {
 			ctx.ui.setStatus("subagent-slash", undefined);
 		}
-		if (response.isError && ctx.hasUI) {
+		if (response.isError && hasUI) {
 			ctx.ui.notify(response.errorText || "Subagent failed", "error");
 		}
 	} catch (error) {
+		if (signal?.aborted || isStaleExtensionContextError(error)) return;
 		const message = error instanceof Error ? error.message : String(error);
+		const hasUI = slashHasUI(ctx);
+		if (hasUI === undefined) return;
 		const failedDetails = failSlashResult(requestId, params, message);
 		pi.sendMessage({
 			customType: SLASH_RESULT_TYPE,
 			content: `## Subagent result\n\n${message}`,
-			display: !ctx.hasUI,
+			display: !hasUI,
 			details: failedDetails,
 		});
 		persistSlashSessionSnapshot(ctx);
-		if (ctx.hasUI) {
+		if (hasUI) {
 			ctx.ui.setStatus("subagent-slash", undefined);
 		}
 		if (message === "Cancelled") {
-			if (ctx.hasUI) ctx.ui.notify("Cancelled", "warning");
+			if (hasUI) ctx.ui.notify("Cancelled", "warning");
 			return;
 		}
-		if (ctx.hasUI) ctx.ui.notify(message, "error");
+		if (hasUI) ctx.ui.notify(message, "error");
 	}
 }
 
-function launchSlashSubagent(
-	pi: ExtensionAPI,
-	ctx: ExtensionContext,
-	params: SubagentParamsLike,
-): void {
-	void runSlashSubagent(pi, ctx, params);
+function slashRunWorkflowScript(key: string, child: Record<string, unknown>): string {
+	return `return runs.run(${JSON.stringify(key)}, ${JSON.stringify(child)})`;
 }
-
 
 export function registerSlashCommands(
 	pi: ExtensionAPI,
 	state: SubagentState,
-): void {
+	options: { fleetKeybindings?: FleetKeybindingsConfig; foregroundDetachShortcut?: string } = {},
+): { dispose: () => void } {
 	let fleetOpen = false;
+	let disposed = false;
+	const pendingRequests = new Set<AbortController>();
+	const runCommand = (ctx: ExtensionContext, params: SubagentParamsLike): Promise<void> => {
+		if (disposed) return Promise.resolve();
+		const controller = new AbortController();
+		pendingRequests.add(controller);
+		return runSlashSubagent(pi, ctx, params, controller.signal).finally(() => pendingRequests.delete(controller));
+	};
+	const launchCommand = (ctx: ExtensionContext, params: SubagentParamsLike): void => {
+		void runCommand(ctx, params);
+	};
 	const showFleet = async (ctx: ExtensionContext) => {
 		state.lastUiContext = ctx;
 		if (!ctx.hasUI) {
-			await runSlashSubagent(pi, ctx, { action: "status", view: "fleet" });
+			await runCommand(ctx, { action: "status", view: "fleet" });
 			return;
 		}
 		if (fleetOpen) {
@@ -648,7 +860,7 @@ export function registerSlashCommands(
 		}
 		fleetOpen = true;
 		try {
-			await openSubagentFleet(ctx, state, { asyncDirRoot: DIRS.async, resultsDir: DIRS.results });
+			await openSubagentFleet(ctx, state, { asyncDirRoot: DIRS.async, resultsDir: DIRS.results, fleetKeybindings: options.fleetKeybindings });
 		} finally {
 			fleetOpen = false;
 		}
@@ -662,8 +874,8 @@ export function registerSlashCommands(
 	});
 
 	pi.registerCommand("run", {
-		description: "Run a subagent directly: /run agent[output=file] [task] [--bg] [--fork]",
-		getArgumentCompletions: makeAgentCompletions(state),
+		description: "Run one subagent through workflowScript: /run agent[output=file] [task] [--bg] [--fork]",
+		getArgumentCompletions: makeAgentCompletions(pi, state),
 		handler: async (args, ctx) => {
 			const { args: cleanedArgs, bg, fork } = extractExecutionFlags(args);
 			const input = cleanedArgs.trim();
@@ -673,35 +885,88 @@ export function registerSlashCommands(
 			const task = firstSpace === -1 ? "" : input.slice(firstSpace + 1).trim();
 
 			if (!state.baseCwd) { ctx.ui.notify("Subagent session cwd is not initialized yet", "error"); return; }
-			const agents = discoverAgents(state.baseCwd, "both").agents;
-			if (!agents.find((a) => a.name === agentName)) { ctx.ui.notify(`Unknown agent: ${agentName}`, "error"); return; }
+			const discovered = discoverSlashAgents(pi, state.baseCwd, "both");
+			const resolvedAgent = resolveAgentName(agentName, discovered.agents);
+			const candidates = resolvedAgent.error
+				? discovered.agents.filter((agent) => resolveAgentName(agentName, [agent]).agent)
+				: resolvedAgent.agent;
+			const diagnostic = findBlockingAgentDiagnostic(agentName, candidates, discovered.agentDiagnostics);
+			if (diagnostic || resolvedAgent.error || !resolvedAgent.agent) {
+				ctx.ui.notify(diagnostic ? `Agent '${agentName}' has invalid configuration: ${diagnostic.error}` : resolvedAgent.error ?? formatUnknownAgentError(agentName, discovered.unknownAgentDiagnosticContext), "error");
+				return;
+			}
 
 			let finalTask = task;
 			if (inline.reads && Array.isArray(inline.reads) && inline.reads.length > 0) {
-				finalTask = `[Read from: ${inline.reads.join(", ")}]\n\n${finalTask}`;
+				const existingReads = inline.reads.filter((read) => resolveExistingReadPaths([read], state.baseCwd).length > 0);
+				if (existingReads.length > 0) finalTask = `[Read from: ${existingReads.join(", ")}]\n\n${finalTask}`;
 			}
-			const params: SubagentParamsLike = { agent: agentName, task: finalTask, clarify: false, agentScope: "both" };
-			if (inline.output !== undefined) params.output = inline.output;
-			if (inline.outputMode !== undefined) params.outputMode = inline.outputMode;
-			if (inline.skill !== undefined) params.skill = inline.skill;
-			if (inline.model) params.model = inline.model;
-			if (bg) params.async = true;
-			if (fork) params.context = "fork";
-			launchSlashSubagent(pi, ctx, params);
+			const child: Record<string, unknown> = { agent: agentName, task: finalTask, agentScope: "both" };
+			if (inline.output !== undefined) child.output = inline.output;
+			if (inline.outputMode !== undefined) child.outputMode = inline.outputMode;
+			if (inline.skill !== undefined) child.skill = inline.skill;
+			if (inline.model) child.model = inline.model;
+			if (fork) child.context = "fork";
+			launchCommand(ctx, { workflowScript: slashRunWorkflowScript("run", child), async: bg ? true : false });
 		},
 	});
 
 	pi.registerCommand("subagent-cost", {
 		description: "Show parent and subagent child usage cost for this session",
 		handler: async (_args, ctx) => {
-			sendSlashText(pi, buildSubagentCostReport(ctx));
+			sendSlashText(pi, buildSubagentCostReport(ctx, state));
 		},
 	});
 
 	pi.registerCommand("subagents-doctor", {
 		description: "Show subagent diagnostics",
 		handler: async (_args, ctx) => {
-			await runSlashSubagent(pi, ctx, { action: "doctor" });
+			await runCommand(ctx, { action: "doctor" });
+		},
+	});
+
+	pi.registerCommand("subagents-inspect-rpc", {
+		description: "Host integration bridge: answer an async child inspection request with a correlated widget payload (no model turn)",
+		handler: async (args, ctx) => {
+			if (ctx.mode === "tui") {
+				ctx.ui.notify("Inspection replies are emitted only on RPC surfaces. Use /subagents or subagent({ action: \"status\", view: \"transcript\" }) interactively.", "info");
+				return;
+			}
+			if (!ctx.hasUI) return;
+			const reply = handleInspectRpcArgs(args, { state });
+			// Emit-then-retract in one handler: stdio delivers the two widget
+			// updates in order, the host buffers the payload by requestId, and
+			// the dedicated key never accumulates visible state.
+			ctx.ui.setWidget(INSPECT_WIDGET_KEY, encodeInspectReply(reply));
+			ctx.ui.setWidget(INSPECT_WIDGET_KEY, undefined);
+		},
+	});
+
+	pi.registerCommand("subagents-guide", {
+		description: "Show a packaged subagents guide topic",
+		getArgumentCompletions: (prefix) => prefix.includes(" ") ? null : SUBAGENT_GUIDE_TOPICS
+			.filter((topic) => topic.startsWith(prefix))
+			.map((topic) => ({ value: topic, label: topic })),
+		handler: async (args, ctx) => {
+			const topic = args.trim();
+			if (topic.includes(" ")) {
+				ctx.ui.notify("Usage: /subagents-guide [topic]", "error");
+				return;
+			}
+			await runCommand(ctx, { action: "guide", ...(topic ? { topic } : {}) });
+		},
+	});
+
+	pi.registerCommand("subagents-refine", {
+		description: "Generate a bounded project-local refinement overlay for one subagent",
+		getArgumentCompletions: makeAgentCompletions(pi, state),
+		handler: async (args, ctx) => {
+			const parts = args.trim().split(/\s+/).filter(Boolean);
+			if (parts.length !== 1) {
+				ctx.ui.notify("Usage: /subagents-refine <agent>", "error");
+				return;
+			}
+			await runCommand(ctx, { action: "refine", agent: parts[0] });
 		},
 	});
 
@@ -710,49 +975,57 @@ export function registerSlashCommands(
 		handler: async (_args, ctx) => showFleet(ctx),
 	});
 
-	pi.registerShortcut(Key.ctrlAlt("f"), {
+	pi.registerShortcut(FLEET_OPEN_SHORTCUT, {
 		description: "Open subagent fleet inspector",
 		handler: async (ctx) => showFleet(ctx),
 	});
 
+	const detachForegroundRun = (args: string, ctx: ExtensionContext): void => {
+		const id = args.trim();
+		let control: ReturnType<typeof selectForegroundDetachControl>;
+		try {
+			control = selectForegroundDetachControl(state, id);
+		} catch (error) {
+			ctx.ui.notify(error instanceof Error ? error.message : String(error), "error");
+			return;
+		}
+		if (!control) {
+			ctx.ui.notify(id ? `No active foreground run found for '${id}'.` : "No active foreground single-subagent run to detach.", "info");
+			return;
+		}
+		if (control.mode !== "single") {
+			ctx.ui.notify("/subagents-detach currently supports single-subagent runs only.", "error");
+			return;
+		}
+		if (!control.detach?.()) {
+			ctx.ui.notify(`Foreground run ${control.runId} is not currently detachable.`, "info");
+			return;
+		}
+		sendSlashText(pi, `Detached foreground run ${control.runId} without terminating its child. Use subagent({ action: "status", id: ${JSON.stringify(control.runId)} }) or bg_wait({ id: ${JSON.stringify(control.runId)} }) to recover the eventual result. This does not daemonize the process or guarantee survival across Pi reload/restart.`);
+	};
+
 	pi.registerCommand("subagents-detach", {
 		description: "Detach the active foreground single-subagent run without terminating it",
-		handler: async (args, ctx) => {
-			const id = args.trim();
-			let control: ReturnType<typeof selectForegroundDetachControl>;
-			try {
-				control = selectForegroundDetachControl(state, id);
-			} catch (error) {
-				ctx.ui.notify(error instanceof Error ? error.message : String(error), "error");
-				return;
-			}
-			if (!control) {
-				ctx.ui.notify(id ? `No active foreground run found for '${id}'.` : "No active foreground single-subagent run to detach.", "info");
-				return;
-			}
-			if (control.mode !== "single") {
-				ctx.ui.notify("/subagents-detach currently supports single-subagent runs only.", "error");
-				return;
-			}
-			if (!control.detach?.()) {
-				ctx.ui.notify(`Foreground run ${control.runId} is not currently detachable.`, "info");
-				return;
-			}
-			sendSlashText(pi, `Detached foreground run ${control.runId} without terminating its child. Use subagent({ action: "status", id: ${JSON.stringify(control.runId)} }) or subagent_wait({ id: ${JSON.stringify(control.runId)} }) to recover the eventual result. This does not daemonize the process or guarantee survival across Pi reload/restart.`);
-		},
+		handler: async (args, ctx) => detachForegroundRun(args, ctx),
 	});
 
+	if (options.foregroundDetachShortcut) {
+		pi.registerShortcut(options.foregroundDetachShortcut as KeyId, {
+			description: "Detach the active foreground subagent and keep it running in the background",
+			handler: async (ctx) => detachForegroundRun("", ctx),
+		});
+	}
+
 	pi.registerCommand("subagents-stop", {
-		description: "Stop a current-session async subagent run",
+		description: "Stop a current-session async subagent run, or one child of it with /subagents-stop <run-id> <child-id>",
 		handler: async (args, ctx) => {
-			const id = args.trim();
-			if (id) {
-				await runSlashSubagent(pi, ctx, { action: "stop", id });
+			const [id, childId, ...extra] = args.trim().split(/\s+/).filter(Boolean);
+			if (extra.length > 0) {
+				sendSlashText(pi, "Usage: /subagents-stop [run-id] [child-id]");
 				return;
 			}
-
-			if (process.env[SUBAGENT_FANOUT_CHILD_ENV] === "1") {
-				sendSlashText(pi, "Selector unavailable in child-safe fanout mode. Pass an explicit current-session top-level async run id, for example `/subagents-stop <run-id>` or `subagent({ action: \"stop\", id: \"<run-id>\" })`.");
+			if (id) {
+				await runCommand(ctx, childId ? { action: "stop", id, childId } : { action: "stop", id });
 				return;
 			}
 
@@ -779,40 +1052,99 @@ export function registerSlashCommands(
 			);
 			if (!result?.confirmed || !result.target) return;
 			if (result.target.kind === "scheduled") {
-				await runSlashSubagent(pi, ctx, { action: "schedule-cancel", id: result.target.id });
+				await runCommand(ctx, { action: "schedule.pause", id: result.target.id });
 				return;
 			}
-			await runSlashSubagent(pi, ctx, { action: "stop", id: result.target.id });
+			await runCommand(ctx, { action: "stop", id: result.target.id });
+		},
+	});
+
+	pi.registerCommand("subagents-steer", {
+		description: "Steer a live async subagent run with a message, or one child of it with --child <child-id>",
+		handler: async (args, ctx) => {
+			const tokens = args.trim().split(/\s+/).filter(Boolean);
+			const usage = "Usage: /subagents-steer <run-id> [--child <child-id>] <message>";
+			const [id, ...rest] = tokens;
+			if (!id || id.startsWith("--")) {
+				sendSlashText(pi, usage);
+				return;
+			}
+			// Only the optional child selector is parsed as a flag. Everything
+			// after the run id (or selector) is free-form message text, including
+			// a leading token such as `--verbose`.
+			let childId: string | undefined;
+			let messageStart = 0;
+			if (rest[0] === "--child" && rest[1] && !rest[1].startsWith("--")) {
+				childId = rest[1];
+				messageStart = 2;
+			}
+			const message = rest.slice(messageStart).join(" ").trim();
+			if (!message) {
+				sendSlashText(pi, usage);
+				return;
+			}
+			let targetId = id;
+			let childIndex: number | undefined;
+			if (childId !== undefined) {
+				const sessionId = state.currentSessionId ?? ctx.sessionManager.getSessionId() ?? undefined;
+				const run = listAsyncRuns(DIRS.async, {
+					runId: id,
+					states: ["queued", "running", "paused"],
+					...(sessionId ? { sessionId } : {}),
+				})[0];
+				const status = run ? readStatus(run.asyncDir) : null;
+				if (!run || !status) {
+					sendSlashText(pi, `No current-session async run found for '${id}'.`);
+					return;
+				}
+				const resolutionStatus = {
+					...status,
+					steps: status.steps?.map((step, index) => ({ ...step, children: run.steps[index]?.children ?? step.children })),
+				};
+				const resolution = resolveAsyncStatusChild(resolutionStatus, childId, { includeNested: true });
+				if (!resolution.ok) {
+					sendSlashText(pi, resolution.message);
+					return;
+				}
+				if (resolution.child.nested) targetId = resolution.child.nested.id;
+				else if (resolution.child.step.runId) targetId = resolution.child.step.runId;
+				else childIndex = resolution.child.index;
+			}
+			await runCommand(ctx, {
+				action: "steer",
+				id: targetId,
+				message,
+				...(childIndex !== undefined ? { index: childIndex } : {}),
+				// Host-style exact-child authority, matching the extension RPC
+				// nonRecoveringSteer guarantee: never swap the addressed child for
+				// a pause-and-revive replacement after a missed acknowledgment.
+				steeringRecovery: false,
+			});
 		},
 	});
 
 	registerPromptWorkflowCommands({
 		pi,
 		run: async (params, ctx) => {
-			launchSlashSubagent(pi, ctx, params);
+			launchCommand(ctx, params);
 		},
 	});
 
 	pi.registerCommand("subagents-models", {
-		description: "Show runtime-loaded builtin subagent models",
-		getArgumentCompletions: makeBuiltinAgentNameCompletions(),
+		description: "Show model mappings for discovered subagents",
+		getArgumentCompletions: makeAgentCompletions(pi, state),
 		handler: async (args, ctx) => {
 			const trimmed = args.trim();
 			if (!trimmed) {
-				await runSlashSubagent(pi, ctx, { action: "models" });
+				await runCommand(ctx, { action: "models" });
 				return;
 			}
 			const parts = trimmed.split(/\s+/).filter(Boolean);
 			if (parts.length !== 1) {
-				ctx.ui.notify("Usage: /subagents-models [builtin-agent-name]", "error");
+				ctx.ui.notify("Usage: /subagents-models [agent-name]", "error");
 				return;
 			}
-			const agent = parts[0]!;
-			if (!(BUILTIN_AGENT_NAMES as readonly string[]).includes(agent)) {
-				ctx.ui.notify(`Unknown builtin agent: ${agent}`, "error");
-				return;
-			}
-			await runSlashSubagent(pi, ctx, { action: "models", agent });
+			await runCommand(ctx, { action: "models", agent: parts[0]! });
 		},
 	});
 
@@ -985,4 +1317,14 @@ export function registerSlashCommands(
 		},
 	});
 
+	return {
+		dispose: () => {
+			if (disposed) return;
+			disposed = true;
+			// A reload revokes the command context; do not let delayed responses
+			// resume a command against the old Pi context.
+			for (const controller of pendingRequests) controller.abort();
+			pendingRequests.clear();
+		},
+	};
 }

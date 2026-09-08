@@ -6,8 +6,17 @@ export interface RunnerSubagentStep {
 	/** Resolved opt-in rules for native Pi child tool calls. */
 	permissionRules?: import("./permissions.ts").PermissionRules;
 	agent: string;
+	/** Human-readable display name for the child session, derived internally at launch. */
+	sessionName?: string;
 	task: string;
 	runner?: ResolvedRunnerConfig;
+	externalJobFollowUp?: {
+		sourceRunId: string;
+		sourceStepIndex: number;
+		parentProviderJobId: string;
+		requestId: string;
+		requestDigest: string;
+	};
 	/** Resolved launch context for this child. */
 	context?: "fresh" | "fork";
 	importAsyncRoot?: {
@@ -21,38 +30,53 @@ export interface RunnerSubagentStep {
 	outputName?: string;
 	structured?: boolean;
 	cwd?: string;
+	/** Original cwd input retained for launch diagnostics. */
+	requestedCwd?: string;
 	model?: string;
+	contextLimit?: number;
+	fast?: boolean;
 	thinking?: string;
+	thinkingCeiling?: import("../../shared/model-info.ts").ThinkingLevel;
 	modelCandidates?: string[];
+	/** The primary model is inherited from the parent session and should not be verified against the child-reported active registry model. */
+	skipPrimaryModelVerification?: boolean;
+	modelVerificationRegistry?: Array<{ provider: string; id: string; fullId: string; contextWindow?: number }>;
+	modelResponseAliases?: Record<string, string[]>;
 	tools?: string[];
+	excludeTools?: string[];
+	allowNestedSubagents?: boolean;
 	extensions?: string[];
 	subagentOnlyExtensions?: string[];
 	mcpDirectTools?: string[];
+	mutationTools?: string[];
 	completionGuard?: boolean;
 	systemPrompt?: string | null;
 	systemPromptMode?: "append" | "replace";
 	inheritProjectContext: boolean;
+	inheritGlobalContext: boolean;
 	inheritSkills: boolean;
 	skills?: string[];
 	outputPath?: string;
+	outputClaimPath?: string;
 	/** Defer the authoritative output instruction until a dynamic fanout item is materialized. */
 	namespaceOutputPath?: boolean;
 	outputMode?: "inline" | "file-only";
 	sessionFile?: string;
 	maxSubagentDepth?: number;
+	timeoutMs?: number;
+	/** Resolved configured hard per-tool-call timeout (ms); fast tools still have a default when undefined. */
+	toolTimeoutMs?: number;
 	waitToolEnabled?: boolean;
-	structuredOutput?: {
-		schema: import("../../shared/types.ts").JsonSchemaObject;
-		schemaPath: string;
-		outputPath: string;
-	};
+	waitToolDefaultTimeoutMs?: number;
+	structuredOutput?: import("./structured-output.ts").StructuredOutputRuntime;
 	structuredOutputSchema?: import("../../shared/types.ts").JsonSchemaObject;
 	agentContract?: import("../../shared/types.ts").AgentContract;
 	definitionDigest?: string;
 	launchBindingTask?: string;
 	launchContractDigest?: string;
-	launchResolvedExtensions?: import("../../shared/types.ts").LaunchResolvedChildExtensionsV1;
-	runtimeAcknowledgedExtensions?: import("../../shared/types.ts").RuntimeAcknowledgedChildExtensionsV1;
+	extensionBindings?: import("./extension-bindings.ts").ExtensionBindings;
+	launchResolvedExtensions?: import("../../shared/types.ts").LaunchResolvedChildExtensions;
+	runtimeAcknowledgedExtensions?: import("../../shared/types.ts").RuntimeAcknowledgedChildExtensions;
 	effectiveAcceptance?: import("../../shared/types.ts").ResolvedAcceptanceConfig;
 	acceptanceInput?: import("../../shared/types.ts").AcceptanceInput;
 	acceptanceRole?: import("../../shared/types.ts").AcceptanceRole;
@@ -60,13 +84,12 @@ export interface RunnerSubagentStep {
 	toolBudget?: import("../../shared/types.ts").ResolvedToolBudget;
 	capabilityCeiling?: import("./capability-ceiling.ts").ResolvedSubagentCapabilityCeiling;
 	capabilityAudit?: import("./capability-ceiling.ts").SubagentCapabilityAudit;
-}
-
-export interface RunnerCheckpointStep {
-	checkpoint: string;
-	message?: string;
-	phase?: string;
-	label?: string;
+	/** Private stable logical-child path for inherited run fan-out accounting. */
+	runFanoutPath?: string;
+	/** Run this single child in one managed worktree. */
+	worktree?: boolean;
+	/** Bounded launch-declared lane metadata; display/triage only. */
+	lane?: import("../../shared/types.ts").WorkflowLaneMetadata;
 }
 
 export interface ParallelStepGroup {
@@ -93,13 +116,10 @@ export interface DynamicRunnerGroup {
 	gateOn?: import("../../shared/types.ts").ChainGateLayer;
 	capabilityCeiling?: import("./capability-ceiling.ts").ResolvedSubagentCapabilityCeiling;
 	capabilityAudit?: import("./capability-ceiling.ts").SubagentCapabilityAudit;
+	thinkingCeiling?: import("../../shared/model-info.ts").ThinkingLevel;
 }
 
-export type RunnerStep = RunnerSubagentStep | ParallelStepGroup | DynamicRunnerGroup | RunnerCheckpointStep;
-
-export function isCheckpointRunnerStep(step: RunnerStep): step is RunnerCheckpointStep {
-	return "checkpoint" in step;
-}
+export type RunnerStep = RunnerSubagentStep | ParallelStepGroup | DynamicRunnerGroup;
 
 export function isParallelGroup(step: RunnerStep): step is ParallelStepGroup {
 	return "parallel" in step && Array.isArray(step.parallel);
@@ -112,9 +132,7 @@ export function isDynamicRunnerGroup(step: RunnerStep): step is DynamicRunnerGro
 export function flattenSteps(steps: RunnerStep[]): RunnerSubagentStep[] {
 	const flat: RunnerSubagentStep[] = [];
 	for (const step of steps) {
-		if (isCheckpointRunnerStep(step)) {
-			continue;
-		} else if (isParallelGroup(step)) {
+		if (isParallelGroup(step)) {
 			for (const task of step.parallel) flat.push(task);
 		} else if (isDynamicRunnerGroup(step)) {
 			continue;

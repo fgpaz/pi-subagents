@@ -3,38 +3,23 @@
  */
 
 import * as fs from "node:fs";
+import * as os from "node:os";
 import * as path from "node:path";
-import type { AgentConfig } from "../agents/agents.ts";
+import { discoverAgents, formatUnknownAgentError, unknownAgentDiagnosticContext, type AgentConfig, type AgentScope, type UnknownAgentDiagnosticContext } from "../agents/agents.ts";
 import { normalizeSkillInput } from "../agents/skills.ts";
+import { normalizeOutputOverride, type OutputOverrideInput, type ResolvedStepBehavior } from "../runs/shared/child-launch-plan.ts";
 import { CHAIN_RUNS_DIR, type AcceptanceInput, type AgentContract, type ChainGateLayer, type JsonSchemaObject, type OutputMode, type ToolBudgetConfig } from "./types.ts";
 const CHAIN_DIR_MAX_AGE_MS = 24 * 60 * 60 * 1000; // 24 hours
 const INITIAL_PROGRESS_CONTENT = "# Progress\n\n## Status\nIn Progress\n\n## Tasks\n\n## Files Changed\n\n## Notes\n";
 
-// =============================================================================
-// Behavior Resolution Types
-// =============================================================================
-
-export interface ResolvedStepBehavior {
-	output: string | false;
-	outputMode: OutputMode;
-	reads: string[] | false;
-	progress: boolean;
-	skills: string[] | false;
-	model?: string;
-}
-
-export interface StepOverrides {
-	output?: string | false;
-	outputMode?: OutputMode;
-	reads?: string[] | false;
-	progress?: boolean;
-	skills?: string[] | false;
-	model?: string;
-}
-
-function normalizeOutputOverride(output: string | false | undefined): string | false | undefined {
-	return output === "false" ? false : output;
-}
+export {
+	planChildLaunch,
+	resolveStepBehavior,
+	resolveTaskTextForFileUpdatePolicy,
+	suppressProgressForReadOnlyTask,
+	taskDisallowsFileUpdates,
+} from "../runs/shared/child-launch-plan.ts";
+export type { ChildLaunchPlan, ChildLaunchPlanInput, OutputOverrideInput, ResolvedStepBehavior, StepOverrides } from "../runs/shared/child-launch-plan.ts";
 
 // =============================================================================
 // Chain Step Types
@@ -49,16 +34,19 @@ export interface SequentialStep {
 	as?: string;
 	outputSchema?: JsonSchemaObject;
 	cwd?: string;
-	output?: string | false;
+	output?: OutputOverrideInput;
 	outputMode?: OutputMode;
 	reads?: string[] | false;
 	progress?: boolean;
 	skill?: string | string[] | false;
 	model?: string;
+	fast?: boolean;
 	toolBudget?: ToolBudgetConfig;
 	acceptance?: AcceptanceInput;
 	agentContract?: AgentContract;
 	gateOn?: ChainGateLayer;
+	/** Internal workflow child isolation; public workflowScript supplies this on runs.run. */
+	worktree?: boolean;
 }
 
 /** Parallel task item within a parallel step */
@@ -71,12 +59,13 @@ export interface ParallelTaskItem {
 	outputSchema?: JsonSchemaObject;
 	cwd?: string;
 	count?: number;
-	output?: string | false;
+	output?: OutputOverrideInput;
 	outputMode?: OutputMode;
 	reads?: string[] | false;
 	progress?: boolean;
 	skill?: string | string[] | false;
 	model?: string;
+	fast?: boolean;
 	toolBudget?: ToolBudgetConfig;
 	acceptance?: AcceptanceInput;
 	agentContract?: AgentContract;
@@ -114,24 +103,6 @@ export interface DynamicParallelStep {
 	gateOn?: ChainGateLayer;
 }
 
-/** Approval checkpoint: pause before later chain steps until parent approval. */
-export interface CheckpointStep {
-	checkpoint: string;
-	message?: string;
-	phase?: string;
-	label?: string;
-	agent?: string;
-	task?: string;
-	as?: string;
-	output?: string | false;
-	outputMode?: OutputMode;
-	reads?: string[] | false;
-	progress?: boolean;
-	skill?: string | string[] | false;
-	skills?: string[] | false;
-	model?: string;
-}
-
 /** Parallel step: multiple agents running concurrently */
 export interface ParallelStep {
 	parallel: ParallelTaskItem[];
@@ -144,15 +115,11 @@ export interface ParallelStep {
 }
 
 /** Union type for chain steps */
-export type ChainStep = SequentialStep | ParallelStep | DynamicParallelStep | CheckpointStep;
+export type ChainStep = SequentialStep | ParallelStep | DynamicParallelStep;
 
 // =============================================================================
 // Type Guards
 // =============================================================================
-
-export function isCheckpointStep(step: ChainStep): step is CheckpointStep {
-	return "checkpoint" in step;
-}
 
 export function isParallelStep(step: ChainStep): step is ParallelStep {
 	return "parallel" in step && Array.isArray((step as ParallelStep).parallel);
@@ -164,9 +131,6 @@ export function isDynamicParallelStep(step: ChainStep): step is DynamicParallelS
 
 /** Get all agent names in a step (single for sequential, multiple for parallel) */
 export function getStepAgents(step: ChainStep): string[] {
-	if (isCheckpointStep(step)) {
-		return [];
-	}
 	if (isParallelStep(step)) {
 		return step.parallel.map((t) => t.agent);
 	}
@@ -234,7 +198,6 @@ export function resolveChainTemplates(
 	steps: ChainStep[],
 ): ResolvedTemplates {
 	return steps.map((step, i) => {
-		if (isCheckpointStep(step)) return "";
 		if (isParallelStep(step)) {
 			// Parallel step: resolve each task's template
 			return step.parallel.map((task) => {
@@ -255,85 +218,38 @@ export function resolveChainTemplates(
 }
 
 // =============================================================================
-// Behavior Resolution
-// =============================================================================
-
-/**
- * Resolve effective chain behavior per step.
- * Priority: step override > agent frontmatter > false (disabled)
- */
-export function resolveStepBehavior(
-	agentConfig: AgentConfig,
-	stepOverrides: StepOverrides,
-	chainSkills?: string[],
-): ResolvedStepBehavior {
-	// Output: step override > frontmatter > false (no output)
-	const stepOutput = normalizeOutputOverride(stepOverrides.output);
-	const output =
-		stepOutput !== undefined
-			? stepOutput
-			: normalizeOutputOverride(agentConfig.output) ?? false;
-
-	// Reads: step override > frontmatter defaultReads > false (no reads)
-	const reads =
-		stepOverrides.reads !== undefined
-			? stepOverrides.reads
-			: agentConfig.defaultReads ?? false;
-
-	// Progress: step override > frontmatter defaultProgress > false
-	const progress =
-		stepOverrides.progress !== undefined
-			? stepOverrides.progress
-			: agentConfig.defaultProgress ?? false;
-
-	let skills: string[] | false;
-	if (stepOverrides.skills === false) {
-		skills = false;
-	} else if (stepOverrides.skills !== undefined) {
-		skills = [...stepOverrides.skills];
-		if (chainSkills && chainSkills.length > 0) {
-			skills = [...new Set([...skills, ...chainSkills])];
-		}
-	} else {
-		skills = agentConfig.skills ? [...agentConfig.skills] : [];
-		if (chainSkills && chainSkills.length > 0) {
-			skills = [...new Set([...skills, ...chainSkills])];
-		}
-	}
-
-	const outputMode = stepOverrides.outputMode ?? "inline";
-	const model = stepOverrides.model ?? agentConfig.model;
-	return { output, outputMode, reads, progress, skills, model };
-}
-
-export function resolveTaskTextForFileUpdatePolicy(task: string | undefined, originalTask?: string): string | undefined {
-	if (!task) return originalTask;
-	return originalTask ? task.replaceAll("{task}", originalTask) : task;
-}
-
-export function taskDisallowsFileUpdates(task: string | undefined): boolean {
-	if (!task) return false;
-	return /\breview[- ]only\b/i.test(task)
-		|| /\bread[- ]only\s+(?:review|audit|inspection|pass)\b/i.test(task)
-		|| /\b(?:no|without)\s+(?:file\s+)?edits?\b/i.test(task)
-		|| /\b(?:do not|don't|must not)\s+(?:edit|modify|write|touch)\b/i.test(task)
-		|| /\bleave\s+files?\s+unchanged\b/i.test(task);
-}
-
-export function suppressProgressForReadOnlyTask(behavior: ResolvedStepBehavior, task: string | undefined, originalTask?: string): ResolvedStepBehavior {
-	const policyTask = resolveTaskTextForFileUpdatePolicy(task, originalTask);
-	return behavior.progress && taskDisallowsFileUpdates(policyTask) ? { ...behavior, progress: false } : behavior;
-}
-
-// =============================================================================
 // Chain Instruction Injection
 // =============================================================================
 
 /**
- * Resolve a file path: absolute paths pass through, relative paths get chainDir prepended.
+ * Expand a leading `~`/`~/` to the user's home directory. Other forms (relative,
+ * absolute, `~user/`) pass through unchanged.
  */
-function resolveChainPath(filePath: string, chainDir: string): string {
-	return path.isAbsolute(filePath) ? filePath : path.join(chainDir, filePath);
+export function expandHomePath(filePath: string): string {
+	if (filePath === "~") return os.homedir();
+	if (filePath.startsWith("~/")) return path.join(os.homedir(), filePath.slice(2));
+	return filePath;
+}
+
+/**
+ * Resolve a file path: `~`/`~/` expand to home first, then absolute paths pass
+ * through and relative paths get chainDir prepended.
+ */
+export function resolveChainPath(filePath: string, chainDir: string): string {
+	const expanded = expandHomePath(filePath);
+	return path.isAbsolute(expanded) ? expanded : path.join(chainDir, expanded);
+}
+
+export function resolveExistingReadInstructionPaths(reads: readonly string[], instructionCwd: string, existenceCwd = instructionCwd): string[] {
+	return reads.flatMap((filePath) => {
+		const instructionPath = resolveChainPath(filePath, instructionCwd);
+		const existencePath = resolveChainPath(filePath, existenceCwd);
+		return fs.existsSync(existencePath) ? [instructionPath] : [];
+	});
+}
+
+export function resolveExistingReadPaths(reads: readonly string[], cwd: string): string[] {
+	return resolveExistingReadInstructionPaths(reads, cwd);
 }
 
 /**
@@ -350,14 +266,15 @@ export function buildChainInstructions(
 	chainDir: string,
 	isFirstProgressAgent: boolean,
 	previousSummary?: string,
+	readExistenceDir = chainDir,
 ): { prefix: string; suffix: string } {
 	const prefixParts: string[] = [];
 	const suffixParts: string[] = [];
 
 	// READS - prepend to override any hardcoded filenames in task text
 	if (behavior.reads && behavior.reads.length > 0) {
-		const files = behavior.reads.map((f) => resolveChainPath(f, chainDir));
-		prefixParts.push(`[Read from: ${files.join(", ")}]`);
+		const files = resolveExistingReadInstructionPaths(behavior.reads, chainDir, readExistenceDir);
+		if (files.length > 0) prefixParts.push(`[Read from: ${files.join(", ")}]`);
 	}
 
 	// OUTPUT - prepend so agent knows where to write
@@ -400,16 +317,24 @@ export function buildChainInstructions(
  * Resolve behaviors for all tasks in a parallel step.
  * Creates namespaced output paths to avoid collisions.
  */
+/** Exact discovery context, or explicit input for defensive fallback discovery. */
+export type ParallelBehaviorDiagnostics = UnknownAgentDiagnosticContext | { cwd: string; scope?: AgentScope };
+
 export function resolveParallelBehaviors(
 	tasks: ParallelTaskItem[],
 	agentConfigs: AgentConfig[],
 	stepIndex: number,
 	chainSkills?: string[],
+	diagnostics?: ParallelBehaviorDiagnostics,
 ): ResolvedStepBehavior[] {
 	return tasks.map((task, taskIndex) => {
 		const config = agentConfigs.find((a) => a.name === task.agent);
 		if (!config) {
-			throw new Error(`Unknown agent: ${task.agent}`);
+			if (!diagnostics) throw new Error("resolveParallelBehaviors requires unknown-agent diagnostic context or fallback discovery input.");
+			const context = "directories" in diagnostics
+				? diagnostics
+				: unknownAgentDiagnosticContext(discoverAgents(path.resolve(diagnostics.cwd), diagnostics.scope ?? "both"));
+			throw new Error(formatUnknownAgentError(task.agent, context));
 		}
 
 		// Build subdirectory path for this parallel task
@@ -459,7 +384,7 @@ export function resolveParallelBehaviors(
 			}
 		}
 
-		const outputMode = task.outputMode ?? "inline";
+		const outputMode = task.outputMode ?? config.outputMode ?? "inline";
 		const model = task.model ?? config.model;
 		return { output, outputMode, reads, progress, skills, model };
 	});

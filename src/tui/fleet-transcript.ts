@@ -2,11 +2,48 @@ import * as fs from "node:fs";
 import * as path from "node:path";
 import { getLanguageFromPath, highlightCode, type ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { Markdown, truncateToWidth, visibleWidth, wrapTextWithAnsi, type MarkdownTheme } from "@earendil-works/pi-tui";
+import { safeTerminalText as safeDisplayText } from "../shared/display-text.ts";
+import { isTrustedRecordedSessionFile } from "../shared/session-file-trust.ts";
 
 const DEFAULT_MAX_RECORDS = 240;
 const DEFAULT_MAX_BYTES = 2 * 1024 * 1024;
 const MAX_MESSAGE_CHARS = 64 * 1024;
 const TOOL_PREVIEW_LINES = 7;
+
+function sanitizeJsonDisplayValue(value: unknown): { value: unknown; changed: boolean } {
+	if (typeof value === "string") {
+		const safe = safeDisplayText(value);
+		return { value: safe, changed: safe !== value };
+	}
+	if (Array.isArray(value)) {
+		const sanitized = value.map(sanitizeJsonDisplayValue);
+		return {
+			value: sanitized.map((entry) => entry.value),
+			changed: sanitized.some((entry) => entry.changed),
+		};
+	}
+	if (value && typeof value === "object") {
+		let changed = false;
+		const sanitized: Record<string, unknown> = Object.create(null);
+		for (const [key, nested] of Object.entries(value)) {
+			const safeKey = safeDisplayText(key);
+			const safeValue = sanitizeJsonDisplayValue(nested);
+			sanitized[safeKey] = safeValue.value;
+			changed ||= safeKey !== key || safeValue.changed;
+		}
+		return { value: changed ? sanitized : value, changed };
+	}
+	return { value, changed: false };
+}
+
+function safeToolArgsPayload(payload: string): string {
+	try {
+		const sanitized = sanitizeJsonDisplayValue(JSON.parse(payload));
+		return sanitized.changed ? JSON.stringify(sanitized.value) : safeDisplayText(payload);
+	} catch {
+		return safeDisplayText(payload);
+	}
+}
 
 type Theme = ExtensionContext["ui"]["theme"];
 
@@ -25,6 +62,8 @@ export interface FleetTranscript {
 
 interface FleetTranscriptReadOptions {
 	trustedRoots: string[];
+	trustedFiles?: string[];
+	trustedFileRoot?: string;
 	maxRecords?: number;
 	maxBytes?: number;
 }
@@ -73,10 +112,13 @@ function isNotFoundError(error: unknown): boolean {
 	return Boolean(objectValue(error)?.code === "ENOENT");
 }
 
-function validateTranscriptPath(filePath: string, trustedRoots: string[]): { resolvedPath?: string; warning?: string } {
-	if (trustedRoots.length === 0) return { warning: `Transcript preview has no trusted root: ${filePath}` };
+function validateTranscriptPath(filePath: string, trustedRoots: string[], trustedFiles: string[] = [], trustedFileRoot?: string): { resolvedPath?: string; warning?: string } {
+	if (trustedRoots.length === 0 && (!trustedFileRoot || trustedFiles.length === 0)) return { warning: `Transcript preview has no trusted root: ${filePath}` };
 	const resolvedPath = path.resolve(filePath);
-	if (!trustedRoots.some((root) => pathWithin(root, resolvedPath))) {
+	const recordedCandidate = trustedFileRoot
+		&& pathWithin(trustedFileRoot, resolvedPath)
+		&& trustedFiles.some((file) => path.resolve(file) === resolvedPath);
+	if (!trustedRoots.some((root) => pathWithin(root, resolvedPath)) && !recordedCandidate) {
 		return { warning: `Transcript is outside trusted roots: ${filePath}` };
 	}
 	let stat: fs.Stats;
@@ -93,7 +135,7 @@ function validateTranscriptPath(filePath: string, trustedRoots: string[]): { res
 		const realRoots = trustedRoots
 			.filter((root) => fs.existsSync(root))
 			.map((root) => fs.realpathSync(root));
-		if (!realRoots.some((root) => pathWithin(root, realPath))) {
+		if (!realRoots.some((root) => pathWithin(root, realPath)) && !isTrustedRecordedSessionFile(realPath, trustedFiles, trustedFileRoot)) {
 			return { warning: `Transcript resolves outside trusted roots: ${filePath}` };
 		}
 		return { resolvedPath: realPath };
@@ -140,6 +182,27 @@ function readTailLines(filePath: string, maxBytes: number): { lines: string[]; t
 function clipMessage(text: string): string {
 	if (text.length <= MAX_MESSAGE_CHARS) return text;
 	return `${text.slice(0, MAX_MESSAGE_CHARS)}\n\n… message truncated`;
+}
+
+function safeTranscriptEvent(event: FleetTranscriptEvent): FleetTranscriptEvent {
+	if (event.kind === "assistant") {
+		return {
+			...event,
+			text: safeDisplayText(event.text),
+			...(event.model ? { model: safeDisplayText(event.model) } : {}),
+		};
+	}
+	if (event.kind === "user" || event.kind === "notice") {
+		return { ...event, text: safeDisplayText(event.text) };
+	}
+	return {
+		...event,
+		name: safeDisplayText(event.name),
+		...(event.args !== undefined ? { args: safeDisplayText(event.args) } : {}),
+		...(event.argsPayload !== undefined ? { argsPayload: safeToolArgsPayload(event.argsPayload) } : {}),
+		...(event.output !== undefined ? { output: safeDisplayText(event.output) } : {}),
+		...(event.error !== undefined ? { error: safeDisplayText(event.error) } : {}),
+	};
 }
 
 function findTool(
@@ -274,13 +337,13 @@ function parseTranscriptLines(lines: string[], conversationStarted = false): { e
 	for (const event of events) {
 		if (event.kind === "tool") delete (event as MutableToolEvent).resultSeen;
 	}
-	return { events, malformed, explicitTruncation };
+	return { events: events.map(safeTranscriptEvent), malformed, explicitTruncation };
 }
 
 export function readFleetTranscript(filePath: string, options: FleetTranscriptReadOptions): FleetTranscript {
-	const validated = validateTranscriptPath(filePath, options.trustedRoots);
+	const validated = validateTranscriptPath(filePath, options.trustedRoots, options.trustedFiles, options.trustedFileRoot);
 	if (!validated.resolvedPath) {
-		return { path: filePath, events: [], truncated: false, ...(validated.warning ? { warning: validated.warning } : {}) };
+		return { path: filePath, events: [], truncated: false, ...(validated.warning ? { warning: safeDisplayText(validated.warning) } : {}) };
 	}
 	const maxRecords = Math.max(1, options.maxRecords ?? DEFAULT_MAX_RECORDS);
 	const tail = readTailLines(validated.resolvedPath, Math.max(1024, options.maxBytes ?? DEFAULT_MAX_BYTES));
@@ -295,7 +358,7 @@ export function readFleetTranscript(filePath: string, options: FleetTranscriptRe
 		path: filePath,
 		events: parsed.events,
 		truncated: tail.truncated || tail.lines.length > maxRecords || parsed.explicitTruncation,
-		...(warnings.length ? { warning: warnings.join(" ") } : {}),
+		...(warnings.length ? { warning: safeDisplayText(warnings.join(" ")) } : {}),
 	};
 }
 
@@ -404,12 +467,13 @@ export function renderFleetTranscript(
 	const lines: string[] = [];
 	if (transcript.truncated) lines.push(bounded(theme.fg("dim", "↑ Earlier activity omitted"), width));
 	if (transcript.warning) {
-		for (const line of renderWrapped(transcript.warning, Math.max(1, width - 2))) {
+		for (const line of renderWrapped(safeDisplayText(transcript.warning), Math.max(1, width - 2))) {
 			lines.push(bounded(`${theme.fg("warning", "!")} ${theme.fg("warning", line)}`, width));
 		}
 	}
 
-	for (const event of transcript.events) {
+	for (const rawEvent of transcript.events) {
+		const event = safeTranscriptEvent(rawEvent);
 		if (event.kind === "tool") {
 			if (options.expandedTools && (event.output || event.argsPayload || event.error)) {
 				lines.push(...renderExpandedTool(event, width, theme));
