@@ -15,6 +15,7 @@ import { runSync } from "../../src/runs/foreground/execution.ts";
 import { childSessionFactory, createDefaultChildSessionFactory, disposeChildSessions, type ChildSessionFactory, type ChildSessionLaunch, type PiCodingAgentModule } from "../../src/runs/shared/child-session.ts";
 import { createNestedRoute } from "../../src/runs/shared/nested-events.ts";
 import { createStructuredOutputRuntime } from "../../src/runs/shared/structured-output.ts";
+import { rewriteSubagentPrompt } from "../../src/runs/shared/subagent-prompt-runtime.ts";
 import type { ForegroundChildSessionControls, SingleResult } from "../../src/shared/types.ts";
 
 async function waitFor(read: () => boolean, timeoutMs = 5_000): Promise<void> {
@@ -71,6 +72,12 @@ describe("in-process foreground child", () => {
 		}
 	});
 
+	it("projects authoritative native-machine Git evidence into the public foreground result", async () => {
+		mockPi.onCall({ output: "done" }); const base = childSessionFactory(); const wrapped: ChildSessionFactory = { async create(input) { const child = await base.create(input); Object.defineProperty(child, "machineEvidence", { value: { machineId: "remote-machine", initial: { head: "aaa", dirty: false }, final: { head: "bbb", dirty: true } } }); return child; }, dispose: () => base.dispose() };
+		const result = await runSync(tempDir, makeAgentConfigs(["echo"]), "echo", "Task", { runId: "native-git-evidence", waitToolEnabled: false, childSessionFactory: wrapped });
+		assert.deepEqual(result.nativeMachine, { provider: "herdr", machineId: "remote-machine", initialGit: { head: "aaa", dirty: false }, finalGit: { head: "bbb", dirty: true } });
+	});
+
 	it("adds the fanout hook and nested route only for fanout-authorized children", async () => {
 		const route = createNestedRoute("hooks-fanout");
 		try {
@@ -108,6 +115,28 @@ describe("in-process foreground child", () => {
 			{ text: "Focus on tests.", mode: "steer" },
 			{ text: "Then update docs.", mode: "followUp" },
 		]);
+	});
+
+	it("does not abort when a steer arrives after the final stop and turn_start is delayed", async () => {
+		mockPi.onCall({
+			jsonl: [events.assistantMessage("before steer")],
+			keepAliveAfterFinalMessageMs: 15_000,
+			queuedMessageTurnStartDelayMs: 1400,
+			queuedMessageOutput: "after steer",
+		});
+		let controls: ForegroundChildSessionControls | undefined;
+		const run = runSync(tempDir, makeAgentConfigs(["echo"]), "echo", "Task", {
+			runId: "queued-steer-after-final",
+			onChildSession: (next) => { controls = next; },
+		});
+		await waitFor(() => controls !== undefined && mockPi.sessions[0]?.scriptedFinalEmitted === true);
+		await controls!.steer("Continue after the final stop.");
+		const result = await run;
+		assert.equal(result.exitCode, 0, result.error);
+		assert.equal(result.error, undefined);
+		assert.equal(result.finalOutput, "after steer");
+		assert.equal(mockPi.sessions[0]?.aborted, false);
+		assert.deepEqual(mockPi.sessions[0]?.steers, [{ text: "Continue after the final stop.", mode: "steer" }]);
 	});
 
 	for (const type of ["turn_start", "agent_start", "auto_retry_start"]) {
@@ -274,6 +303,82 @@ describe("default child session factory", () => {
 		assert.deepEqual(flags, [true, true]);
 	});
 
+	it("runs the child prompt rewrite before ambient prompt capture without reordering ambient extensions", async () => {
+		const agentPrompt = '<active_agent name="remotion-editor"/>\n\neditor instructions';
+		const globalPath = path.join(process.env.HOME ?? process.env.USERPROFILE ?? process.cwd(), ".pi", "agent", "AGENTS.md");
+		const projectPath = path.join(process.cwd(), "AGENTS.md");
+		const orchestrationSkill = '<skill><name>pi-subagents</name><location>/skills/pi-subagents/SKILL.md</location></skill>';
+		const assemble = (extra: string) => `${agentPrompt}${extra}`;
+		const destructivePrompt = assemble([
+			"", "<project_context>",
+			`<project_instructions path="${globalPath}">global parent-only instructions</project_instructions>`,
+			`<project_instructions path="${projectPath}">project instructions</project_instructions>`,
+			"</project_context>", orchestrationSkill,
+		].join("\n\n"));
+		const boundaryOnlyPrompt = assemble("");
+		const orderedPaths: string[][] = [];
+		const captureResults: boolean[] = [];
+		const forwardedPrompts: string[] = [];
+		const pi = stubPi();
+		pi.DefaultResourceLoader = class {
+			loaded = false;
+			private readonly options: { extensionsOverride?: (base: { extensions: Array<{ path: string }>; errors: unknown[]; runtime: object }) => { extensions: Array<{ path: string }>; errors: unknown[]; runtime: object } };
+			private result = { extensions: [] as Array<{ path: string }>, errors: [] as unknown[], runtime: {} };
+			constructor(options: typeof this.options) { this.options = options; }
+			async reload() {
+				const base = {
+					extensions: [
+						{ path: "/ambient/first.ts" },
+						{ path: "/ambient/claude-bridge.ts" },
+						{ path: "/ambient/last.ts" },
+						{ path: "<inline:pi-subagents:prompt-runtime>" },
+						{ path: "<inline:pi-subagents:completion-intent>" },
+					],
+					errors: [] as unknown[],
+					runtime: {},
+				};
+				this.result = this.options.extensionsOverride?.(base) ?? base;
+				orderedPaths.push(this.result.extensions.map(({ path: extensionPath }) => extensionPath));
+				for (const original of [boundaryOnlyPrompt, destructivePrompt]) {
+					let prompt = original;
+					let captured: string | undefined;
+					for (const { path: extensionPath } of this.result.extensions) {
+						if (extensionPath === "<inline:pi-subagents:prompt-runtime>") {
+							prompt = rewriteSubagentPrompt(prompt, { inheritProjectContext: true, inheritGlobalContext: false, inheritSkills: true });
+						}
+						if (extensionPath === "/ambient/claude-bridge.ts") captured = prompt;
+					}
+					captureResults.push(captured === prompt || (captured !== undefined && prompt.includes(captured)));
+					forwardedPrompts.push(prompt);
+				}
+			}
+			getExtensions() { return this.result; }
+		} as unknown as PiCodingAgentModule["DefaultResourceLoader"];
+
+		const factory = createDefaultChildSessionFactory({ loadPiCodingAgent: async () => pi });
+		await factory.create({
+			...stubLaunch,
+			ambientExtensions: true,
+			hooks: [
+				{ name: "pi-subagents:prompt-runtime", factory() {} },
+				{ name: "pi-subagents:completion-intent", factory() {} },
+			],
+		});
+
+		assert.deepEqual(orderedPaths[0], [
+			"<inline:pi-subagents:prompt-runtime>",
+			"/ambient/first.ts",
+			"/ambient/claude-bridge.ts",
+			"/ambient/last.ts",
+			"<inline:pi-subagents:completion-intent>",
+		]);
+		assert.deepEqual(captureResults, [true, true], "bridge-style capture must resolve both wrapping and destructive filtering");
+		assert.match(forwardedPrompts[1]!, /editor instructions/);
+		assert.match(forwardedPrompts[1]!, /project instructions/);
+		assert.doesNotMatch(forwardedPrompts[1]!, /global parent-only instructions/);
+		assert.doesNotMatch(forwardedPrompts[1]!, /<name>pi-subagents<\/name>/);
+	});
+
 	it("resolves models from providers queued during child extension loading", async () => {
 		const registeredProviders: string[] = [];
 		const registeredNativeProviders: string[] = [];
@@ -342,22 +447,41 @@ describe("default child session factory", () => {
 		assert.deepEqual(errors, ["<loader>"]);
 	});
 
-	it("initializes the theme from settings before each child session", async () => {
-		const themed: Array<string | undefined> = [];
+	it("preserves an initialized parent theme when creating a child session", async () => {
+		const themeKey = Symbol.for("@earendil-works/pi-coding-agent:theme");
+		const globals = globalThis as Record<symbol, unknown>;
+		const previousTheme = globals[themeKey];
+		const initialized: Array<string | undefined> = [];
 		const pi = stubPi();
-		pi.initTheme = ((themeName?: string) => { themed.push(themeName); }) as PiCodingAgentModule["initTheme"];
-		pi.SettingsManager = { create: () => ({ getTheme: () => "solarized-dark" }) } as unknown as PiCodingAgentModule["SettingsManager"];
+		pi.initTheme = ((themeName?: string) => { initialized.push(themeName); }) as PiCodingAgentModule["initTheme"];
+		pi.SettingsManager = { create: () => ({ getTheme: () => "vesper-light/vesper-dark" }) } as unknown as PiCodingAgentModule["SettingsManager"];
 		const factory = createDefaultChildSessionFactory({ loadPiCodingAgent: async () => pi });
-		await factory.create(stubLaunch);
-		await factory.create(stubLaunch);
-		assert.deepEqual(themed, ["solarized-dark", "solarized-dark"]);
+		globals[themeKey] = { name: "vesper-light" };
+		try {
+			await factory.create(stubLaunch);
+			assert.deepEqual(initialized, []);
+		} finally {
+			if (previousTheme === undefined) delete globals[themeKey];
+			else globals[themeKey] = previousTheme;
+		}
 	});
 
-	it("skips theme initialization when the pi module has no initTheme export", async () => {
-		const factory = createDefaultChildSessionFactory({ loadPiCodingAgent: async () => stubPi() });
-		await factory.create(stubLaunch);
-		// Reaching here without throwing is the assertion: `settingsManager.getTheme()`
-		// must not be evaluated when `initTheme` is unavailable.
+	it("initializes the theme in a headless runner process", async () => {
+		const themeKey = Symbol.for("@earendil-works/pi-coding-agent:theme");
+		const globals = globalThis as Record<symbol, unknown>;
+		const previousTheme = globals[themeKey];
+		const initialized: Array<string | undefined> = [];
+		const pi = stubPi();
+		pi.initTheme = ((themeName?: string) => { initialized.push(themeName); }) as PiCodingAgentModule["initTheme"];
+		pi.SettingsManager = { create: () => ({ getTheme: () => "vesper-light/vesper-dark" }) } as unknown as PiCodingAgentModule["SettingsManager"];
+		const factory = createDefaultChildSessionFactory({ loadPiCodingAgent: async () => pi });
+		delete globals[themeKey];
+		try {
+			await factory.create(stubLaunch);
+			assert.deepEqual(initialized, ["vesper-light/vesper-dark"]);
+		} finally {
+			if (previousTheme !== undefined) globals[themeKey] = previousTheme;
+		}
 	});
 
 	it("disposes the session when bindExtensions rejects", async () => {

@@ -12,8 +12,8 @@ export const KNOWN_FIELDS = new Set([
 	"tools",
 	"excludeTools",
 	"allowNestedSubagents",
+	"allowedAgents",
 	"model",
-	"fallbackModels",
 	"fast",
 	"thinking",
 	"systemPromptMode",
@@ -32,8 +32,10 @@ export const KNOWN_FIELDS = new Set([
 	"extensions",
 	"subagentOnlyExtensions",
 	"mutationTools",
+	"machine",
 	"output",
 	"outputMode",
+	"outputSchema",
 	"defaultReads",
 	"defaultProgress",
 	"interactive",
@@ -78,10 +80,11 @@ export function serializeAgent(config: AgentConfig, options: SerializeAgentOptio
 	if (config.allowNestedSubagents === true || preserve("allowNestedSubagents")) {
 		lines.push(`allowNestedSubagents: ${config.allowNestedSubagents === undefined ? "" : config.allowNestedSubagents ? "true" : "false"}`);
 	}
+	if (config.allowedAgents !== undefined || preserve("allowedAgents")) {
+		lines.push(`allowedAgents: ${joinComma(config.allowedAgents) ?? ""}`);
+	}
 
 	if (config.model || preserve("model")) lines.push(`model: ${config.model ?? ""}`);
-	const fallbackModelsValue = joinComma(config.fallbackModels);
-	if (fallbackModelsValue || preserve("fallbackModels")) lines.push(`fallbackModels: ${fallbackModelsValue ?? ""}`);
 	if (config.fast === true || preserve("fast")) lines.push(`fast: ${config.fast === undefined ? "" : config.fast ? "true" : "false"}`);
 	if ((config.thinking && (config.thinking !== "off" || preserve("thinking"))) || (!config.thinking && preserve("thinking"))) {
 		lines.push(`thinking: ${config.thinking ?? ""}`);
@@ -127,8 +130,10 @@ export function serializeAgent(config: AgentConfig, options: SerializeAgentOptio
 	const mutationToolsValue = joinComma(config.mutationTools);
 	if (mutationToolsValue || preserve("mutationTools")) lines.push(`mutationTools: ${mutationToolsValue ?? ""}`);
 
+	if (config.machine || preserve("machine")) lines.push(`machine: ${config.machine ?? ""}`);
 	if (config.output || preserve("output")) lines.push(`output: ${config.output ?? ""}`);
 	if (config.outputMode || preserve("outputMode")) lines.push(`outputMode: ${config.outputMode ?? ""}`);
+	if (config.outputSchema || preserve("outputSchema")) lines.push(`outputSchema: ${config.outputSchema ? JSON.stringify(config.outputSchema) : ""}`);
 
 	const readsValue = joinComma(config.defaultReads);
 	if (readsValue || preserve("defaultReads")) lines.push(`defaultReads: ${readsValue ?? ""}`);

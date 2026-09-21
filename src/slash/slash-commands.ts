@@ -25,12 +25,12 @@ import { resolveAsyncStatusChild } from "../runs/shared/child-identity.ts";
 import { readStatus } from "../shared/utils.ts";
 import { getArtifactPaths, getArtifactsDir } from "../shared/artifacts.ts";
 import { readWorkflowReceipt } from "../workflows/workflow-receipt.ts";
-import { FLEET_OPEN_SHORTCUT } from "../shared/shortcuts.ts";
 import type { SlashSubagentResponse, SlashSubagentUpdate } from "./slash-bridge.ts";
 import { registerPromptWorkflowCommands } from "./prompt-workflows.ts";
 import { openSubagentsAdmin } from "./subagents-admin.ts";
 import { SUBAGENT_GUIDE_TOPICS } from "../extension/subagent-guide.ts";
 import { openSubagentFleet } from "../tui/fleet.ts";
+import { createBuiltinInspectorPlugins } from "../inspectors/plugins.ts";
 import {
 	applySlashUpdate,
 	buildSlashInitialResult,
@@ -860,7 +860,7 @@ export function registerSlashCommands(
 		}
 		fleetOpen = true;
 		try {
-			await openSubagentFleet(ctx, state, { asyncDirRoot: DIRS.async, resultsDir: DIRS.results, fleetKeybindings: options.fleetKeybindings });
+			await openSubagentFleet(ctx, state, { asyncDirRoot: DIRS.async, inspectorPlugins: createBuiltinInspectorPlugins(), resultsDir: DIRS.results, fleetKeybindings: options.fleetKeybindings });
 		} finally {
 			fleetOpen = false;
 		}
@@ -973,11 +973,6 @@ export function registerSlashCommands(
 	pi.registerCommand("subagents-fleet", {
 		description: "Open the live subagent fleet inspector",
 		handler: async (_args, ctx) => showFleet(ctx),
-	});
-
-	pi.registerShortcut(FLEET_OPEN_SHORTCUT, {
-		description: "Open subagent fleet inspector",
-		handler: async (ctx) => showFleet(ctx),
 	});
 
 	const detachForegroundRun = (args: string, ctx: ExtensionContext): void => {

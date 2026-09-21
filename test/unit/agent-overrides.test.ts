@@ -57,7 +57,7 @@ describe("builtin agent overrides", () => {
 		assert.ok(builtins.length > 0);
 		assert.deepEqual(
 			builtins
-				.filter((agent) => agent.model !== undefined || agent.fallbackModels !== undefined)
+				.filter((agent) => agent.model !== undefined)
 				.map((agent) => agent.name),
 			[],
 		);
@@ -88,6 +88,63 @@ describe("builtin agent overrides", () => {
 		assert.equal(reviewer?.modelSource, undefined);
 	});
 
+	it("applies machine placement overrides with project beating user and false clearing a pin", () => {
+		writeJson(path.join(tempHome, ".pi", "agent", "settings.json"), {
+			subagents: { agentOverrides: { "claude-code": { machine: "workmac" }, "codex-exec": { machine: "workmac" }, "cursor-agent": { machine: "workmac" } } },
+		});
+		writeJson(path.join(tempProject, ".pi", "settings.json"), {
+			subagents: { agentOverrides: { "codex-exec": { machine: "gpu-box" }, "cursor-agent": { machine: false } } },
+		});
+
+		const builtins = discoverAgentsAll(tempProject).builtin;
+		assert.equal(builtins.find((agent) => agent.name === "claude-code")?.machine, "workmac");
+		assert.equal(builtins.find((agent) => agent.name === "codex-exec")?.machine, "gpu-box");
+		assert.equal(builtins.find((agent) => agent.name === "cursor-agent")?.machine, undefined);
+		assert.deepEqual(builtins.find((agent) => agent.name === "cursor-agent")?.override?.fields, ["machine"]);
+
+		// The disable/reset rewrite keeps a placement: the override is rebuilt from the agent's current fields.
+		const claude = builtins.find((agent) => agent.name === "claude-code")!;
+		assert.deepEqual(buildBuiltinOverrideConfig({ ...claude.override!.base }, { ...claude }), { machine: "workmac" });
+		assert.deepEqual(buildBuiltinOverrideConfig({ ...claude.override!.base, machine: "pinned" }, { ...claude, machine: undefined }), { machine: false });
+	});
+
+	it("rejects malformed machine overrides", () => {
+		writeJson(path.join(tempHome, ".pi", "agent", "settings.json"), { subagents: { agentOverrides: { "claude-code": { machine: 7 } } } });
+		assert.throws(() => discoverAgentsAll(tempProject), /field 'machine' must be a non-empty string or false/u);
+	});
+
+	it("replaces and clears custom-agent allowedAgents while preserving explicit deny-all", () => {
+		writeProjectAgent(tempProject, "coordinator", "---\nname: coordinator\ndescription: Coordinator\nallowedAgents: scout\n---\n\nCoordinate.\n");
+		writeJson(path.join(tempHome, ".pi", "agent", "settings.json"), {
+			subagents: { agentOverrides: { coordinator: { allowedAgents: false } } },
+		});
+		assert.equal(discoverAgents(tempProject, "both").agents.find((agent) => agent.name === "coordinator")?.allowedAgents, undefined);
+
+		writeJson(path.join(tempProject, ".pi", "settings.json"), {
+			subagents: { agentOverrides: { coordinator: { allowedAgents: [] } } },
+		});
+		assert.deepEqual(discoverAgents(tempProject, "both").agents.find((agent) => agent.name === "coordinator")?.allowedAgents, []);
+
+		writeJson(path.join(tempProject, ".pi", "settings.json"), {
+			subagents: { agentOverrides: { coordinator: { allowedAgents: ["worker", "reviewer"] } } },
+		});
+		assert.deepEqual(discoverAgents(tempProject, "both").agents.find((agent) => agent.name === "coordinator")?.allowedAgents, ["reviewer", "worker"]);
+	});
+
+	it("rejects removed fallbackModels in user agent overrides", () => {
+		writeJson(path.join(tempHome, ".pi", "agent", "settings.json"), {
+			subagents: { agentOverrides: { worker: { fallbackModels: ["model/backup"] } } },
+		});
+		assert.throws(() => discoverAgentsAll(tempProject), /removed field 'fallbackModels'; configure one model instead/u);
+	});
+
+	it("rejects removed fallbackModels in project agent overrides", () => {
+		writeJson(path.join(tempProject, ".pi", "settings.json"), {
+			subagents: { agentOverrides: { worker: { fallbackModels: ["model/backup"] } } },
+		});
+		assert.throws(() => discoverAgentsAll(tempProject), /removed field 'fallbackModels'; configure one model instead/u);
+	});
+
 	it("lets a builtin agent inherit Pi's normal tools from an override", () => {
 		writeJson(path.join(tempHome, ".pi", "agent", "settings.json"), {
 			subagents: {
@@ -113,7 +170,9 @@ describe("builtin agent overrides", () => {
 
 		const builtins = discoverAgentsAll(tempProject).builtin;
 		assert.equal(builtins.find((agent) => agent.name === "researcher")?.tools, undefined);
-		assert.deepEqual(builtins.find((agent) => agent.name === "reviewer")?.tools, ["read", "grep", "find", "ls", "contact_supervisor"]);
+		assert.deepEqual(builtins.find((agent) => agent.name === "reviewer")?.tools, ["read", "grep", "find", "ls", "watchdog_diff", "contact_supervisor"]);
+		assert.deepEqual(builtins.find((agent) => agent.name === "worker")?.tools, ["read", "grep", "find", "ls", "bash", "edit", "write", "contact_supervisor"]);
+		assert.deepEqual(builtins.find((agent) => agent.name === "scout")?.tools, ["read", "grep", "find", "ls", "bash", "write", "contact_supervisor"]);
 	});
 
 	it("keeps explicit empty builtin tool allowlists distinct from inherited tools", () => {
@@ -568,19 +627,18 @@ describe("builtin agent overrides", () => {
 
 	it("layers a project override on top of a user override for a custom agent instead of discarding it", () => {
 		// Regression test: a custom agent (e.g. a reviewer persona shipped as a .md
-		// file with no model/thinking/fallbackModels in frontmatter) that gets its
+		// file with no model/thinking in frontmatter) that gets its
 		// model pin exclusively from a *user*-scope agentOverrides entry must keep
 		// that pin when a *project*-scope override adds an unrelated field (here:
 		// subagentOnlyExtensions). Previously the project override for this agent
 		// name replaced the user override wholesale, silently dropping model /
-		// thinking / fallbackModels with no error.
+		// thinking with no error.
 		writeJson(path.join(tempHome, ".pi", "agent", "settings.json"), {
 			subagents: {
 				agentOverrides: {
 					"persona-reviewer": {
 						model: "anthropic/claude-opus-4-8",
 						thinking: "high",
-						fallbackModels: ["anthropic/claude-sonnet-4-6"],
 					},
 				},
 			},
@@ -601,7 +659,6 @@ describe("builtin agent overrides", () => {
 		assert.ok(reviewer);
 		assert.equal(reviewer.model, "anthropic/claude-opus-4-8");
 		assert.equal(reviewer.thinking, "high");
-		assert.deepEqual(reviewer.fallbackModels, ["anthropic/claude-sonnet-4-6"]);
 		assert.deepEqual(reviewer.subagentOnlyExtensions, ["./tools/child-only.ts"]);
 		assert.equal(reviewer.override?.scope, "project");
 	});
@@ -740,7 +797,6 @@ describe("builtin agent overrides", () => {
 						outputMode: "file-only",
 						defaultReads: ["CONTEXT.md", "docs/spec.md"],
 						model: "anthropic/claude-sonnet-4-6",
-						fallbackModels: ["openai/gpt-5-mini"],
 						fast: true,
 						thinking: "high",
 						systemPromptMode: "append",
@@ -765,7 +821,6 @@ describe("builtin agent overrides", () => {
 		assert.equal(implementer.outputMode, "file-only");
 		assert.deepEqual(implementer.defaultReads, ["CONTEXT.md", "docs/spec.md"]);
 		assert.equal(implementer.model, "anthropic/claude-sonnet-4-6");
-		assert.deepEqual(implementer.fallbackModels, ["openai/gpt-5-mini"]);
 		assert.equal(implementer.fast, true);
 		assert.equal(implementer.thinking, "high");
 		assert.equal(implementer.systemPromptMode, "append");
@@ -920,6 +975,15 @@ describe("builtin agent overrides", () => {
 		assert.equal(fs.existsSync(settingsPath), false);
 		removeBuiltinAgentOverride(tempProject, "reviewer", "user");
 		assert.equal(fs.existsSync(settingsPath), false);
+	});
+
+	it("does not preserve empty or whitespace machine values when clearing other override fields", () => {
+		const settingsPath = path.join(tempHome, ".pi", "agent", "settings.json");
+		for (const machine of ["", " \t "]) {
+			writeJson(settingsPath, { subagents: { agentOverrides: { reviewer: { machine, model: "openai/gpt-5.4" } } } });
+			removeBuiltinAgentOverride(tempProject, "reviewer", "user", { preserveMachine: true });
+			assert.equal((JSON.parse(fs.readFileSync(settingsPath, "utf-8")) as { subagents?: unknown }).subagents, undefined);
+		}
 	});
 
 	it("surfaces malformed settings files instead of silently ignoring them", () => {
@@ -1092,7 +1156,6 @@ describe("builtin agent overrides", () => {
 				output: "base-output.md",
 				defaultReads: ["base-read.md"],
 				model: "openai-codex/gpt-5.4-mini",
-				fallbackModels: ["openai/gpt-5-mini"],
 				thinking: "high",
 				systemPromptMode: "append",
 				inheritProjectContext: true,
@@ -1112,7 +1175,6 @@ describe("builtin agent overrides", () => {
 				output: undefined,
 				defaultReads: undefined,
 				model: undefined,
-				fallbackModels: undefined,
 				thinking: undefined,
 				systemPromptMode: "replace",
 				inheritProjectContext: false,
@@ -1134,7 +1196,6 @@ describe("builtin agent overrides", () => {
 			output: false,
 			defaultReads: false,
 			model: false,
-			fallbackModels: false,
 			thinking: false,
 			systemPromptMode: "replace",
 			inheritProjectContext: false,

@@ -17,7 +17,7 @@ import * as path from "node:path";
 import { fileURLToPath } from "node:url";
 import { setChildSessionFactoryModule } from "../../src/runs/shared/child-session.ts";
 import { createEventBus, createTempDir, events, makeAgent, removeTempDir } from "../support/helpers.ts";
-import { deliverInterruptRequest, deliverStopRequest } from "../../src/runs/background/control-channel.ts";
+import { deliverInterruptRequest, deliverStopRequest, requestAsyncSteer } from "../../src/runs/background/control-channel.ts";
 import { SUBAGENT_PROCESS_TERMINAL_EVENT } from "../../src/shared/types.ts";
 import { waitForSubagents } from "../../src/runs/background/subagent-wait.ts";
 import type { AsyncResultPayload, AsyncStatusPayload } from "../support/async-execution-fixture.ts";
@@ -178,9 +178,21 @@ const args = process.argv.slice(2);
 if (args.includes('--version')) { console.log('wt v0.75.0'); process.exit(0); }
 if (args.includes('--help')) { console.log('--create --base --no-cd --no-hooks --format'); process.exit(0); }
 if (${allocatorFailure}) require('node:child_process').execFileSync('git', ['branch', args[args.indexOf('--create') + 1]], { cwd: ${JSON.stringify(repo)} });
-const socket = require('node:net').connect(${port}, '127.0.0.1', () => socket.write('ready'));
-socket.on('data', data => {
- if (data.toString() === 'release') { socket.end(); if (${allocatorFailure}) process.exitCode = 1; else console.log('{}'); }
+// Complete the setup stdin contract before exposing the independent release gate.
+// Otherwise the hook can exit before the runner writes input and cause EPIPE.
+let input = '';
+process.stdin.setEncoding('utf8');
+process.stdin.on('data', chunk => { input += chunk; });
+process.stdin.on('end', () => {
+ if (!${allocatorFailure}) {
+  const setup = JSON.parse(input);
+  require('node:assert/strict').equal(setup.runId, ${JSON.stringify(`${id}-s0`)});
+  require('node:assert/strict').equal(setup.repoRoot, ${JSON.stringify(fs.realpathSync(repo))});
+ }
+ const socket = require('node:net').connect(${port}, '127.0.0.1', () => socket.write('ready'));
+ socket.on('data', data => {
+  if (data.toString() === 'release') { socket.end(); if (${allocatorFailure}) process.exitCode = 1; else console.log('{}'); }
+ });
 });
 setTimeout(() => process.exit(90), 15000).unref();
 `, { mode: 0o755 });
@@ -564,7 +576,7 @@ setTimeout(() => process.exit(90), 15000).unref();
 		await withIsolatedWatchdogSettings(tempDir, async () => {
 			writeWatchdogSettings(tempDir);
 			const id = `async-watchdog-blocker-${Date.now().toString(36)}`;
-			mockPi.onCall({ jsonl: [events.acceptanceReport(), events.watchdogWarning("blocker", "Claims tests passed without running them")] });
+			mockPi.onCall({ jsonl: [events.acceptanceReport(), events.watchdogStatusWarning("blocker", "Claims tests passed without running them", { runId: id, agent: "worker", childIndex: 0 })] });
 
 			executeAsyncSingle(id, {
 				agent: "worker",
@@ -587,6 +599,35 @@ setTimeout(() => process.exit(90), 15000).unref();
 			assert.equal(check?.status, "failed");
 			assert.match(check?.message ?? "", /Unresolved watchdog blocker/);
 		});
+	});
+
+	it("background does not abort when a steer arrives after the final stop and turn_start is delayed", { skip: !isAsyncAvailable() ? "jiti not available" : undefined }, async () => {
+		mockPi.onCall({
+			jsonl: [events.assistantMessage("before steer")],
+			keepAliveAfterFinalMessageMs: 15_000,
+			queuedMessageTurnStartDelayMs: 1400,
+			queuedMessageOutput: "after steer",
+		});
+		const id = `async-queued-steer-after-final-${Date.now().toString(36)}`;
+		executeAsyncSingle(id, {
+			agent: "worker", task: "Do work", agentConfig: makeAgent("worker"),
+			ctx: { pi: { events: { emit() {} } }, cwd: tempDir, currentSessionId: "session-1" },
+			artifactConfig: { enabled: false, includeInput: false, includeOutput: false, includeJsonl: false, includeMetadata: false, cleanupDays: 7 },
+			shareEnabled: false, sessionRoot: path.join(tempDir, "sessions"), maxSubagentDepth: 2,
+		});
+		await waitForMockPiCall(mockPi, 0, 10_000);
+		const scriptedFinal = path.join(mockPi.dir, "scripted-final.jsonl");
+		const deadline = Date.now() + 10_000;
+		while (!fs.existsSync(scriptedFinal)) {
+			if (Date.now() > deadline) assert.fail("Timed out waiting for scripted final message");
+			await new Promise((resolve) => setTimeout(resolve, 20));
+		}
+		requestAsyncSteer(path.join(ASYNC_DIR, id), { message: "Continue after the final stop.", id: "after-final", ts: Date.now() });
+		const payload = await readAsyncPayload(id);
+		assert.equal(payload.success, true, payload.results[0]?.error);
+		assert.equal(payload.results[0]?.error, undefined);
+		assert.equal(payload.results[0]?.output, "after steer");
+		assert.doesNotMatch(JSON.stringify(payload), /did not settle within \d+ms after its terminal event/);
 	});
 
 	for (const type of ["turn_start", "agent_start", "auto_retry_start"]) {
@@ -818,7 +859,6 @@ setTimeout(() => process.exit(90), 15000).unref();
 			assert.match(diagnostic, /^Subagent produced no output after terminal assistant stopReason "aborted"\./);
 			assert.match(diagnostic, new RegExp(`Required file-only output was not produced: ${escapeRegExp(outputPath)}`));
 			assert.doesNotMatch(diagnostic, /completed without making edits/);
-			assert.doesNotMatch(child?.modelAttempts?.[0]?.error ?? "", /completed without making edits/);
 			assert.equal(child?.effects?.fileMutation?.status, "observed");
 			assert.equal(child?.effects?.fileMutation?.attempted, true);
 			assert.deepEqual(child?.effects?.fileMutation?.evidence?.changedFiles, ["input.md"]);
@@ -882,7 +922,6 @@ setTimeout(() => process.exit(90), 15000).unref();
 		assert.match(diagnostic, /^Subagent produced no output after terminal assistant stopReason "aborted"\./);
 		assert.match(diagnostic, /Required file-only output was not produced/);
 		assert.doesNotMatch(diagnostic, /completed without making edits/);
-		assert.doesNotMatch(child?.modelAttempts?.[0]?.error ?? "", /completed without making edits/);
 		assert.equal(child?.effects?.settlementDiagnostic?.requiredOutput?.missing, true);
 		assert.equal(child?.effects?.settlementDiagnostic?.finalTextPresent, true);
 		assert.equal(fs.existsSync(outputPath), false);
@@ -938,7 +977,6 @@ setTimeout(() => process.exit(90), 15000).unref();
 		assert.equal(payload.success, false);
 		assert.equal(child?.success, false);
 		assert.match(diagnostic, /^This operation was aborted/);
-		assert.match(diagnostic, /Compaction-induced child abort could not be resumed safely: retained session unavailable\./);
 		assert.match(diagnostic, /failure followed session compaction and agent settlement/);
 		assert.match(diagnostic, /Required file-only output was not produced/);
 		assert.ok(diagnostic.length <= 8_192);

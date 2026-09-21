@@ -21,7 +21,7 @@ import { resolveSubagentLaunchContract } from "../../src/api/preflight.ts";
 import { discoverAgents } from "../../src/agents/agents.ts";
 import { runSync } from "../../src/runs/foreground/execution.ts";
 import { ACTIVE_ASYNC_CAPACITY_DIR, acquireActiveAsyncCapacity, activeAsyncCapacitySessionKey, getActiveAsyncCapacitySnapshot } from "../../src/runs/background/active-async-capacity.ts";
-import { recordModelFailure } from "../../src/runs/shared/model-exclusions.ts";
+import type { SubagentState } from "../../src/shared/types.ts";
 import type { AsyncExecutionResult, AsyncResultPayload, AsyncStatusPayload, MockPiCallRecord } from "../support/async-execution-fixture.ts";
 import {
 	installAsyncExecutionHooks, mockAssistantMessage, available, isAsyncAvailable,
@@ -111,7 +111,7 @@ describe("async execution utilities", { skip: !available ? "pi packages not avai
 		assert.equal(typeof result, "boolean");
 	});
 
-	it("does not persist terminal async workflow status when the result index write fails", { skip: !isAsyncAvailable() || !createSubagentExecutor ? "jiti or executor not available" : undefined }, async () => {
+	it("persists the committed terminal workflow outcome when result index creation fails", { skip: !isAsyncAvailable() || !createSubagentExecutor ? "jiti or executor not available" : undefined }, async () => {
 		const id = `async-workflow-result-index-failure-${Date.now().toString(36)}`;
 		const resultIndexPath = path.join(RESULTS_DIR, "result-index");
 		let asyncDir: string | undefined;
@@ -123,7 +123,30 @@ describe("async execution utilities", { skip: !available ? "pi packages not avai
 			fs.rmSync(resultIndexPath, { recursive: true, force: true });
 			fs.mkdirSync(RESULTS_DIR, { recursive: true });
 			fs.writeFileSync(resultIndexPath, "not a directory", "utf-8");
-			const executor = makeAsyncExecutor([]);
+			let publicationFailureWakes = 0;
+			let deliveryRefreshes = 0;
+			const state: SubagentState = {
+				baseCwd: tempDir,
+				currentSessionId: null,
+				asyncJobs: new Map(),
+				foregroundControls: new Map(),
+				lastForegroundControlId: null,
+			};
+			const executor = createSubagentExecutor!({
+				pi: {
+					events: { on: () => () => {}, emit() {} },
+					getSessionName: () => undefined,
+					sendMessage: () => { publicationFailureWakes++; },
+				},
+				state,
+				config: {},
+				asyncByDefault: false,
+				tempArtifactsDir: tempDir,
+				getSubagentSessionRoot: () => tempDir,
+				expandTilde: (value: string) => value,
+				discoverAgents: () => ({ agents: [] }),
+				refreshResultDelivery: () => { deliveryRefreshes++; },
+			});
 			const context = makeMinimalCtx(tempDir);
 			context.sessionManager.getSessionId = () => "session-workflow-index";
 
@@ -135,19 +158,24 @@ describe("async execution utilities", { skip: !available ? "pi packages not avai
 			resultPath = path.join(RESULTS_DIR, `${asyncId}.json`);
 			pendingPath = path.join(RESULTS_DIR, "result-pending", encodeURIComponent("session-workflow-index"), `${encodeURIComponent(asyncId)}.json`);
 
-			const eventsPath = path.join(asyncDir, "events.jsonl");
-			const deadline = Date.now() + 5_000;
-			let eventsText = "";
-			while (Date.now() <= deadline) {
-				eventsText = readIfExists(eventsPath) ?? "";
-				if (eventsText.includes("subagent.workflow.result_write_failed")) break;
-				await new Promise((resolve) => setTimeout(resolve, 50));
-			}
-			assert.match(eventsText, /subagent\.workflow\.result_write_failed/);
-			const status = JSON.parse(fs.readFileSync(path.join(asyncDir, "status.json"), "utf-8")) as AsyncStatusPayload;
-			assert.equal(status.state, "running");
+			const status = await waitForAsyncState(asyncId, (candidate) => candidate.state === "complete", 5_000);
+			const eventsText = readIfExists(path.join(asyncDir, "events.jsonl")) ?? "";
+			assert.match(eventsText, /subagent\.workflow\.completed/);
+			assert.doesNotMatch(eventsText, /subagent\.workflow\.result_write_failed/);
+			assert.equal(status.state, "complete");
+			assert.equal(typeof status.endedAt, "number");
 			assert.equal(fs.existsSync(resultPath), false);
 			assert.equal(fs.existsSync(pendingPath), true);
+			const committed = JSON.parse(fs.readFileSync(pendingPath, "utf8")) as AsyncResultPayload & { runId: string };
+			assert.equal(committed.runId, asyncId);
+			assert.equal(committed.sessionId, "session-workflow-index");
+			assert.equal(committed.state, "complete");
+			assert.equal(committed.success, true);
+			assert.equal(fs.existsSync(path.join(ASYNC_DIR, ".active-runs", asyncId)), false);
+			assert.equal(state.asyncJobs.get(asyncId)?.status, "complete", "terminal jobs no longer create delivery demand");
+			assert.equal(state.workflowControllers?.has(asyncId), false);
+			assert.equal(publicationFailureWakes, 0);
+			assert.equal(deliveryRefreshes, 1, "the committed result follows ordinary delivery recovery");
 		} finally {
 			console.error = originalError;
 			if (asyncDir) fs.rmSync(asyncDir, { recursive: true, force: true });
@@ -172,11 +200,11 @@ describe("async execution utilities", { skip: !available ? "pi packages not avai
 					assert.ok(error instanceof Error);
 					assert.match(error.message, new RegExp(`"steps":\\["${stepState}"\\]`));
 					assert.ok(error.message.includes(`mock queue: readable, prompt call records=${callCount}`));
-					assert.match(error.message, /runner.stdout.log: empty/);
-					assert.match(error.message, /runner.stderr.log: unreadable \(EISDIR\)/);
-					assert.match(error.message, /process-terminal.json: absent/);
-					assert.match(error.message, /runner-startup-proceed.json: readable, \d+ bytes \(contents withheld\)/);
-					assert.match(error.message, /events.jsonl: readable/);
+					assert.match(error.message, /runner.stdout.log: \{"bytes":0,.*\} \(contents withheld\)/);
+					assert.match(error.message, /runner.stderr.log: \{"bytes":\d+,.*\} \(contents withheld\)/);
+					assert.match(error.message, /process-terminal.json: ENOENT/);
+					assert.match(error.message, /runner-startup-proceed.json: \{"bytes":\d+,.*\} \(contents withheld\)/);
+					assert.match(error.message, /events.jsonl: .*"invalidLines":1/);
 					assert.doesNotMatch(error.message, /secret-/);
 					return true;
 				});
@@ -307,7 +335,8 @@ describe("async execution utilities", { skip: !available ? "pi packages not avai
 		try {
 			const discovered = discoverAgents(tempDir).agents.find((agent) => agent.name === agentName);
 			assert.ok(discovered, "expected temporary agent definition to be discovered");
-			const preflight = await resolveSubagentLaunchContract({ agent: agentName, cwd: tempDir, task, runId: "contract-preflight" });
+			// runSync and executeAsyncSingle sit below the executor step that applies the bridge.
+			const preflight = await resolveSubagentLaunchContract({ agent: agentName, cwd: tempDir, task, runId: "contract-preflight", intercomBridge: { mode: "off" } });
 			assert.equal(preflight.ok, true);
 			assert.ok(preflight.contract.tools.extensionArgs.some((entry) => entry.endsWith(path.join("pi-permission-system", "src", "index.ts"))));
 
@@ -337,6 +366,40 @@ describe("async execution utilities", { skip: !available ? "pi packages not avai
 			if (previousAgentDir === undefined) delete process.env.PI_CODING_AGENT_DIR;
 			else process.env.PI_CODING_AGENT_DIR = previousAgentDir;
 		}
+	});
+
+	it("matches preflight launch and definition digests for executor-launched async runs with the Intercom bridge active", { skip: !isAsyncAvailable() || !createSubagentExecutor ? "jiti or executor not available" : undefined }, async () => {
+		const agentName = `bridge-async-${Date.now().toString(36)}`;
+		const task = "Compare bridged async launch identity.";
+		const agentPath = path.join(tempDir, ".pi", "agents", `${agentName}.md`);
+		fs.mkdirSync(path.dirname(agentPath), { recursive: true });
+		fs.writeFileSync(agentPath, `---\nname: ${agentName}\ndescription: Bridged async worker\ntools:\n  - read\ncompletionGuard: false\n---\nAnswer from the task only.\n`, "utf-8");
+		const discovered = discoverAgents(tempDir).agents.find((agent) => agent.name === agentName);
+		assert.ok(discovered, "expected temporary agent definition to be discovered");
+
+		const preflight = await resolveSubagentLaunchContract({ agent: agentName, cwd: tempDir, task, runId: "bridged-async" });
+		assert.equal(preflight.ok, true);
+		if (!preflight.ok) return;
+		assert.deepEqual(preflight.contract.intercomBridge, { mode: "always", active: true });
+		assert.ok(preflight.contract.tools.effectiveAllowlist.includes("contact_supervisor"));
+
+		mockPi.onCall({ output: "bridged async done" });
+		const launch = await makeAsyncExecutor([discovered]).execute(
+			"bridged-async-launch",
+			{ agent: agentName, task, async: true, runId: "bridged-async", acceptance: false },
+			new AbortController().signal,
+			undefined,
+			makeMinimalCtx(tempDir),
+		) as AsyncExecutionResult;
+		assert.equal(launch.isError, undefined, launch.content?.[0]?.text);
+		assert.ok(launch.details.asyncId);
+		assert.equal(launch.details.launchContractDigest, preflight.contract.launchContractDigest);
+
+		// launchContractDigest embeds the definition digest, so equality here also
+		// proves the async path hashed the parsed definition, not the bridged copy.
+		const payload = await readAsyncPayload(launch.details.asyncId);
+		assert.equal(payload.launchContractDigest, preflight.contract.launchContractDigest);
+		assert.equal(payload.results[0]?.launchContractDigest, preflight.contract.launchContractDigest);
 	});
 
 	it("persists the actual launch digest in async status and result metadata", { skip: !isAsyncAvailable() ? "jiti not available" : undefined }, async () => {
@@ -392,161 +455,6 @@ describe("async execution utilities", { skip: !available ? "pi packages not avai
 		const recoveryCallArgs = readMockPiArgs(mockPi, 0);
 		assert.equal(recoveryCallArgs[recoveryCallArgs.indexOf("--tools") + 1], "read,intercom,contact_supervisor");
 		assert.deepEqual(readMockPiRequiredTools(mockPi, 0), ["read"]);
-	});
-
-	it("rejects an explicit unknown model before spawn even when a fallback exists", { skip: !isAsyncAvailable() ? "jiti not available" : undefined }, () => {
-		mockPi.onCall({ output: "should not spawn" });
-		const launch = executeAsyncSingle(`async-explicit-unknown-model-${Date.now().toString(36)}`, {
-			agent: "worker",
-			task: "Do work",
-			agentConfig: makeAgent("worker", { model: "mock/fallback", fallbackModels: ["mock/fallback"], completionGuard: false }),
-			modelOverride: "mock/does-not-exist",
-			modelOrigin: "explicit",
-			availableModels: [{ provider: "mock", id: "fallback", fullId: "mock/fallback" }],
-			ctx: { pi: { events: { emit() {} } }, cwd: tempDir, currentSessionId: "session-1" },
-			artifactConfig: { enabled: false, includeInput: false, includeOutput: false, includeJsonl: false, includeMetadata: false, cleanupDays: 7 },
-			shareEnabled: false,
-			maxSubagentDepth: 2,
-			acceptance: false,
-		});
-		assert.equal(launch.isError, true);
-		assert.match(launch.content[0]?.text ?? "", /Unknown subagent model 'mock\/does-not-exist'/);
-		assert.equal(mockPi.callCount(), 0);
-	});
-
-	it("retries configured fallbacks after a valid explicit primary fails", { skip: !isAsyncAvailable() ? "jiti not available" : undefined }, async () => {
-		mockPi.onCall({
-			jsonl: [{
-				type: "message_end",
-				message: {
-					role: "assistant",
-					content: [{ type: "text", text: "primary failed" }],
-					model: "openai/gpt-5-mini",
-					errorMessage: "rate limit exceeded",
-					usage: { input: 10, output: 5, cacheRead: 0, cacheWrite: 0, cost: { total: 0.01 } },
-				},
-			}],
-			exitCode: 1,
-		});
-		mockPi.onCall({ output: "explicit fallback recovered" });
-		const id = `async-explicit-model-fallback-${Date.now().toString(36)}`;
-		const launch = executeAsyncSingle(id, {
-			agent: "worker",
-			task: "Do work",
-			agentConfig: makeAgent("worker", { model: "mock/configured", fallbackModels: ["anthropic/claude-sonnet-4"], completionGuard: false }),
-			modelOverride: "openai/gpt-5-mini",
-			modelOrigin: "explicit",
-			availableModels: [
-				{ provider: "mock", id: "configured", fullId: "mock/configured" },
-				{ provider: "openai", id: "gpt-5-mini", fullId: "openai/gpt-5-mini" },
-				{ provider: "anthropic", id: "claude-sonnet-4", fullId: "anthropic/claude-sonnet-4" },
-			],
-			ctx: { pi: { events: { emit() {} } }, cwd: tempDir, currentSessionId: "session-1" },
-			artifactConfig: { enabled: false, includeInput: false, includeOutput: false, includeJsonl: false, includeMetadata: false, cleanupDays: 7 },
-			shareEnabled: false,
-			maxSubagentDepth: 2,
-			acceptance: false,
-		});
-
-		assert.equal(launch.isError, undefined, launch.content[0]?.text ?? "launch failed");
-		const payload = await readAsyncPayload(id);
-		assert.equal(payload.success, true);
-		assert.equal(payload.results[0]?.model, "anthropic/claude-sonnet-4");
-		assert.deepEqual(payload.results[0]?.attemptedModels, ["openai/gpt-5-mini", "anthropic/claude-sonnet-4"]);
-		assert.equal(mockPi.callCount(), 2);
-	});
-
-	it("rejects an explicit cached-excluded model before spawn even when a fallback exists", { skip: !isAsyncAvailable() ? "jiti not available" : undefined }, () => {
-		recordModelFailure({ modelId: "blocked", provider: "mock", reason: "sk-secret-token-xyz" });
-		mockPi.onCall({ output: "should not spawn" });
-		const launch = executeAsyncSingle(`async-explicit-cached-excluded-${Date.now().toString(36)}`, {
-			agent: "worker",
-			task: "Do work",
-			agentConfig: makeAgent("worker", { model: "mock/fallback", fallbackModels: ["mock/fallback"], completionGuard: false }),
-			modelOverride: "mock/blocked",
-			modelOrigin: "explicit",
-			availableModels: [
-				{ provider: "mock", id: "blocked", fullId: "mock/blocked" },
-				{ provider: "mock", id: "fallback", fullId: "mock/fallback" },
-			],
-			ctx: { pi: { events: { emit() {} } }, cwd: tempDir, currentSessionId: "session-1" },
-			artifactConfig: { enabled: false, includeInput: false, includeOutput: false, includeJsonl: false, includeMetadata: false, cleanupDays: 7 },
-			shareEnabled: false,
-			maxSubagentDepth: 2,
-			acceptance: false,
-		});
-		assert.equal(launch.isError, true);
-		assert.match(launch.content[0]?.text ?? "", /is excluded and cannot be replaced by a fallback/);
-		assert.equal((launch.content[0]?.text ?? "").includes("sk-secret-token-xyz"), false);
-		assert.equal(mockPi.callCount(), 0);
-	});
-
-	it("rejects fallback-only configurations with no launch candidates before spawn", { skip: !isAsyncAvailable() ? "jiti not available" : undefined }, () => {
-		mockPi.onCall({ output: "should not spawn" });
-		const launch = executeAsyncSingle(`async-fallback-only-zero-candidates-${Date.now().toString(36)}`, {
-			agent: "worker",
-			task: "Do work",
-			agentConfig: makeAgent("worker", { fallbackModels: ["does-not-exist"], completionGuard: false }),
-			availableModels: [{ provider: "mock", id: "fallback", fullId: "mock/fallback" }],
-			ctx: { pi: { events: { emit() {} } }, cwd: tempDir, currentSessionId: "session-1" },
-			artifactConfig: { enabled: false, includeInput: false, includeOutput: false, includeJsonl: false, includeMetadata: false, cleanupDays: 7 },
-			shareEnabled: false,
-			maxSubagentDepth: 2,
-			acceptance: false,
-		});
-		assert.equal(launch.isError, true);
-		assert.match(launch.content[0]?.text ?? "", /Unknown subagent model 'does-not-exist'/);
-		assert.equal(mockPi.callCount(), 0);
-	});
-
-	it("rejects an explicit non-strict out-of-scope model before spawn even when a fallback exists", { skip: !isAsyncAvailable() ? "jiti not available" : undefined }, () => {
-		mockPi.onCall({ output: "should not spawn" });
-		const launch = executeAsyncSingle(`async-explicit-scope-${Date.now().toString(36)}`, {
-			agent: "worker",
-			task: "Do work",
-			agentConfig: makeAgent("worker", { model: "mock/fallback", fallbackModels: ["mock/fallback"], completionGuard: false }),
-			modelOverride: "mock/blocked",
-			modelOrigin: "explicit",
-			availableModels: [
-				{ provider: "mock", id: "blocked", fullId: "mock/blocked" },
-				{ provider: "mock", id: "fallback", fullId: "mock/fallback" },
-			],
-			ctx: {
-				pi: { events: { emit() {} } },
-				cwd: tempDir,
-				currentSessionId: "session-1",
-				modelScope: { enforce: true, allow: ["mock/fallback"] },
-			},
-			artifactConfig: { enabled: false, includeInput: false, includeOutput: false, includeJsonl: false, includeMetadata: false, cleanupDays: 7 },
-			shareEnabled: false,
-			maxSubagentDepth: 2,
-			acceptance: false,
-		});
-		assert.equal(launch.isError, true);
-		assert.match(launch.content[0]?.text ?? "", /outside the configured subagent model scope/);
-		assert.equal(mockPi.callCount(), 0);
-	});
-
-	it("uses a configured fallback when the agent primary is unavailable", { skip: !isAsyncAvailable() ? "jiti not available" : undefined }, async () => {
-		const id = `async-configured-fallback-${Date.now().toString(36)}`;
-		mockPi.onCall({ output: "fallback model ran" });
-		const launch = executeAsyncSingle(id, {
-			agent: "worker",
-			task: "Do work",
-			agentConfig: makeAgent("worker", { model: "mock/missing-primary", fallbackModels: ["mock/fallback"], completionGuard: false }),
-			modelOrigin: "configured",
-			availableModels: [{ provider: "mock", id: "fallback", fullId: "mock/fallback" }],
-			ctx: { pi: { events: { emit() {} } }, cwd: tempDir, currentSessionId: "session-1" },
-			artifactConfig: { enabled: false, includeInput: false, includeOutput: false, includeJsonl: false, includeMetadata: false, cleanupDays: 7 },
-			shareEnabled: false,
-			maxSubagentDepth: 2,
-			acceptance: false,
-		});
-		assert.equal(launch.isError, undefined, launch.content[0]?.text ?? "launch failed");
-		const payload = await readAsyncPayload(id);
-		assert.equal(payload.success, true);
-		assert.equal(payload.results[0]?.model, "mock/fallback");
-		assert.equal(mockPi.callCount(), 1);
 	});
 
 	it("rejects async thinking above maxThinking before child startup", { skip: !isAsyncAvailable() ? "jiti not available" : undefined }, () => {
@@ -1102,6 +1010,33 @@ describe("async execution utilities", { skip: !available ? "pi packages not avai
 		assert.ok(outputPath && metadataPath);
 		assert.equal(fs.readFileSync(outputPath, "utf-8"), "completed after artifact cleanup");
 		assert.equal((JSON.parse(fs.readFileSync(metadataPath, "utf-8")) as { exitCode?: number }).exitCode, 0);
+	});
+
+	it("publishes machine-readable output artifact persistence failure", { skip: !isAsyncAvailable() ? "jiti not available" : undefined }, async () => {
+		mockPi.onCall({ delay: 800, output: "artifact write should fail" });
+		const id = `async-artifact-output-failure-${Date.now().toString(36)}`;
+		const artifactsDir = path.join(tempDir, ".pi/subagents", id);
+		executeAsyncSingle(id, {
+			agent: "worker",
+			task: "Report artifact persistence failure",
+			agentConfig: makeAgent("worker", { completionGuard: false }),
+			ctx: { pi: { events: { emit() {} } }, cwd: tempDir, currentSessionId: "session-1" },
+			artifactConfig: { enabled: true, includeInput: true, includeOutput: true, includeJsonl: false, includeMetadata: true, cleanupDays: 7 },
+			artifactsDir,
+			shareEnabled: false,
+			maxSubagentDepth: 2,
+			acceptance: false,
+		});
+
+		await waitForMockPiCall(mockPi, 0);
+		const inputArtifact = fs.readdirSync(artifactsDir).find((file) => file.endsWith("_input.md"));
+		assert.ok(inputArtifact);
+		const sabotagedOutput = path.join(artifactsDir, inputArtifact.replace(/_input\.md$/, "_output.md"));
+		fs.mkdirSync(sabotagedOutput);
+		const child = (await readAsyncPayload(id)).results[0];
+		assert.equal(child?.artifactPaths?.outputPath, sabotagedOutput);
+		assert.match(child?.outputSaveError ?? "", /Artifact output post-processing failed/);
+		assert.equal(child?.artifactOutputSaveFailed, true);
 	});
 
 	it("background preserves retry lifecycle from an oversized agent_end aggregate", { skip: !isAsyncAvailable() ? "jiti not available" : undefined }, async () => {

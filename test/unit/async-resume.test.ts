@@ -3,7 +3,8 @@ import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import { describe, it } from "node:test";
-import { asyncReviveRequiresRecoveryDescriptor, buildRevivedAsyncTask, resolveAsyncResumeTarget } from "../../src/runs/background/async-resume.ts";
+import { applySteeringRecoveryAgentConfig, asyncReviveRequiresRecoveryDescriptor, buildRevivedAsyncTask, resolveAsyncResumeTarget } from "../../src/runs/background/async-resume.ts";
+import type { AgentConfig } from "../../src/agents/agents.ts";
 import { createRunFanoutBudget } from "../../src/runs/shared/run-fanout-budget.ts";
 
 function writeJson(filePath: string, value: object): void {
@@ -294,21 +295,46 @@ describe("async resume lookup", () => {
 				...descriptor,
 				launchContractDigest: "launch-contract-digest",
 				allowNestedSubagents: true,
+				allowedAgents: ["worker", "scout", "worker"],
 				intercomBridge: { mode: "off" },
 				extensionBindings: { "shepherd.dispatch/1": { role: "coder" } },
+				requiredExtensions: [{ id: "provider", path: path.join(root, "provider.mjs") }],
 			});
 			const valid = resolveAsyncResumeTarget({ id: "run-descriptor" }, { asyncDirRoot: asyncRoot, resultsDir });
 			assert.equal(valid.launchContractDigest, "launch-contract-digest");
 			assert.equal(valid.recoveryDescriptor?.launchContractDigest, "launch-contract-digest");
 			assert.equal(valid.recoveryDescriptor?.allowNestedSubagents, true);
+			assert.deepEqual(valid.recoveryDescriptor?.allowedAgents, ["scout", "worker"]);
 			assert.deepEqual(valid.recoveryDescriptor?.intercomBridge, { mode: "off" });
 			assert.deepEqual(valid.recoveryDescriptor?.extensionBindings, { "shepherd.dispatch/1": { role: "coder" } });
+			assert.deepEqual(valid.recoveryDescriptor?.requiredExtensions, [{ id: "provider", path: path.join(root, "provider.mjs") }]);
+			assert.ok(Object.isFrozen(valid.recoveryDescriptor?.requiredExtensions));
+			const currentAgent = {
+				name: "worker", description: "Current", systemPrompt: "Current", systemPromptMode: "replace",
+				inheritProjectContext: false, inheritGlobalContext: false, inheritSkills: false,
+				source: "project", filePath: "/current/worker.md", allowedAgents: ["reviewer", "worker"],
+			} as AgentConfig;
+			assert.deepEqual(applySteeringRecoveryAgentConfig(currentAgent, valid.recoveryDescriptor!).allowedAgents, ["scout", "worker"]);
+
+			writeJson(path.join(asyncDir, "recovery-descriptor.json"), { ...descriptor, allowedAgents: [] });
+			const denied = resolveAsyncResumeTarget({ id: "run-descriptor" }, { asyncDirRoot: asyncRoot, resultsDir });
+			assert.deepEqual(applySteeringRecoveryAgentConfig(currentAgent, denied.recoveryDescriptor!).allowedAgents, []);
+
+			writeJson(path.join(asyncDir, "recovery-descriptor.json"), descriptor);
+			const unrestricted = resolveAsyncResumeTarget({ id: "run-descriptor" }, { asyncDirRoot: asyncRoot, resultsDir });
+			assert.equal(applySteeringRecoveryAgentConfig(currentAgent, unrestricted.recoveryDescriptor!).allowedAgents, undefined);
 
 			writeJson(path.join(asyncDir, "recovery-descriptor.json"), { ...descriptor, allowNestedSubagents: "true" });
 			assert.throws(() => resolveAsyncResumeTarget({ id: "run-descriptor" }, { asyncDirRoot: asyncRoot, resultsDir }), /allowNestedSubagents/);
 
+			writeJson(path.join(asyncDir, "recovery-descriptor.json"), { ...descriptor, allowedAgents: ["bad name"] });
+			assert.throws(() => resolveAsyncResumeTarget({ id: "run-descriptor" }, { asyncDirRoot: asyncRoot, resultsDir }), /allowedAgents entry 'bad name'/);
+
 			writeJson(path.join(asyncDir, "recovery-descriptor.json"), { ...descriptor, extensionBindings: { invalid: true } });
 			assert.throws(() => resolveAsyncResumeTarget({ id: "run-descriptor" }, { asyncDirRoot: asyncRoot, resultsDir }), /namespace/);
+
+			writeJson(path.join(asyncDir, "recovery-descriptor.json"), { ...descriptor, requiredExtensions: [{ id: "unsafe id", path: "/provider.mjs" }] });
+			assert.throws(() => resolveAsyncResumeTarget({ id: "run-descriptor" }, { asyncDirRoot: asyncRoot, resultsDir }), /safe id/);
 
 			writeJson(path.join(asyncDir, "recovery-descriptor.json"), { ...descriptor, sourceRunId: "another-run" });
 			assert.throws(() => resolveAsyncResumeTarget({ id: "run-descriptor" }, { asyncDirRoot: asyncRoot, resultsDir }), /different source run/);
@@ -509,6 +535,34 @@ describe("async resume lookup", () => {
 			);
 		} finally {
 			fs.rmSync(root, { recursive: true, force: true });
+		}
+	});
+
+	it("rejects a stopped child selected from a terminal aggregate", () => {
+		for (const stoppedStep of [{ status: "stopped" }, { status: "failed", stopped: true }]) {
+			const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-async-resume-stopped-child-"));
+			try {
+				const asyncRoot = path.join(root, "runs");
+				const stoppedSession = path.join(root, "stopped.jsonl");
+				const completedSession = path.join(root, "completed.jsonl");
+				fs.writeFileSync(stoppedSession, "", "utf-8");
+				fs.writeFileSync(completedSession, "", "utf-8");
+				writeJson(path.join(asyncRoot, "run-aggregate", "status.json"), {
+					runId: "run-aggregate", mode: "parallel", state: "failed", startedAt: 100, endedAt: 200, lastUpdate: 200, cwd: root,
+					steps: [
+						{ agent: "stopped-child", ...stoppedStep, sessionFile: stoppedSession },
+						{ agent: "completed-child", status: "complete", sessionFile: completedSession },
+					],
+				});
+
+				assert.throws(
+					() => resolveAsyncResumeTarget({ id: "run-aggregate", index: 0 }, { asyncDirRoot: asyncRoot, resultsDir: path.join(root, "results") }),
+					/child 0 was stopped and cannot be resumed/,
+				);
+				assert.equal(resolveAsyncResumeTarget({ id: "run-aggregate", index: 1 }, { asyncDirRoot: asyncRoot, resultsDir: path.join(root, "results") }).agent, "completed-child");
+			} finally {
+				fs.rmSync(root, { recursive: true, force: true });
+			}
 		}
 	});
 

@@ -17,6 +17,8 @@ import { registerChildWatchdog } from "../../watchdog/register-child.ts";
 import type { ChildWatchdogConfig } from "../../watchdog/child-status.ts";
 import { requestWatchdogPermission, type WatchdogPermissionRequest, type WatchdogPermissionResult } from "../../watchdog/permission-arbiter.ts";
 import { SUBAGENT_WATCHDOG_WARNING_TYPE } from "../../watchdog/types.ts";
+import { captureWatchdogDiffBaseline, createWatchdogDiffTool, WATCHDOG_DIFF_TOOL_NAME } from "../../watchdog/diff-tool.ts";
+import { inheritedNestedRouteOf } from "./nested-events.ts";
 import { registerWaitTool } from "../background/wait-tool.ts";
 import { drainOutstandingWork } from "../background/auto-drain.ts";
 import {
@@ -451,10 +453,17 @@ export default function registerSubagentPromptRuntime(pi: ExtensionAPI, config?:
 	registerPermissionGate(pi, config.permissions, config.childWatchdog);
 	registerToolBudget(pi, config.toolBudget);
 	registerChildWatchdog(pi, config.childWatchdog, config.watchdogStatus);
-	const waitState = {
+	const reviewerLaunchBaseline = config.requiredTools?.includes(WATCHDOG_DIFF_TOOL_NAME) && config.cwd
+		? captureWatchdogDiffBaseline(config.cwd)
+		: undefined;
+	if (reviewerLaunchBaseline && typeof pi.registerTool === "function") {
+		pi.registerTool(createWatchdogDiffTool(reviewerLaunchBaseline, { workingTreeAtLaunch: true }));
+	}
+	const waitState = config.runtimeState ?? {
 		baseCwd: "",
 		currentSessionId: null,
 		asyncJobs: new Map(),
+		foregroundRuns: new Map(),
 		foregroundControls: new Map(),
 		lastForegroundControlId: null,
 		cleanupTimers: new Map(),
@@ -465,7 +474,8 @@ export default function registerSubagentPromptRuntime(pi: ExtensionAPI, config?:
 		watcherRestartTimer: null,
 		resultFileCoalescer: { schedule: () => false, clear: () => {} },
 	} as unknown as SubagentState;
-	if (typeof pi.registerTool === "function") registerWaitTool(pi, waitState, config.waitTool.enabled, undefined, config.waitTool.defaultTimeoutMs);
+	const nestedRootRunId = inheritedNestedRouteOf(config)?.rootRunId;
+	if (typeof pi.registerTool === "function") registerWaitTool(pi, waitState, config.waitTool.enabled, undefined, config.waitTool.defaultTimeoutMs, { nestedRootRunId });
 	const supervisorMetadata = childSupervisorMetadata(config);
 	let nativeSupervisorClientRegistered = false;
 	const registerNativeSupervisorClientOnce = (): void => {
@@ -486,13 +496,18 @@ export default function registerSubagentPromptRuntime(pi: ExtensionAPI, config?:
 		if (diagnostic) throw new Error(formatChildToolDiagnostic(diagnostic));
 	});
 	onRuntimeEvent("agent_end", async (_event: unknown, ctx: unknown) => {
-		if ((ctx as { hasUI?: boolean } | undefined)?.hasUI === true) { drainObservation?.deny(); return; }
+		if ((ctx as { hasUI?: boolean } | undefined)?.hasUI === true) drainObservation?.deny();
 		if (drainObservation) {
 			try {
 				if ((ctx as ExtensionContext)?.sessionManager?.getSessionFile() !== waitState.currentSessionId) drainObservation.deny();
 			} catch { drainObservation.deny(); }
 		}
-		await drainOutstandingWork({ state: waitState, events: pi.events }, drainObservation);
+		config.holdFinalDrain?.(true);
+		try {
+			await drainOutstandingWork({ state: waitState, events: pi.events, nestedRootRunId, hasPendingSupervisorRequest: config.hasPendingSupervisorRequest }, drainObservation);
+		} finally {
+			config.holdFinalDrain?.(false);
+		}
 	});
 	if (config.structuredOutput) registerStructuredOutputTool(pi, config.structuredOutput);
 
