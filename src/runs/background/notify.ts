@@ -47,6 +47,7 @@ export interface SubagentNotifyDetails {
 	source?: "async" | "foreground";
 	taskInfo?: string;
 	resultPreview: string;
+	acceptance?: { status?: string };
 	durationMs?: number;
 	workflowRunId?: string;
 	childRuns?: Array<{ runId: string; workflowKey?: string; agent?: string; status?: string }>;
@@ -87,6 +88,7 @@ export interface CompletionNotification {
 	timedOut?: boolean;
 	stopped?: boolean;
 	turnBudgetExceeded?: boolean;
+	acceptance?: { status?: string };
 	results?: Array<{
 		runId?: string;
 		workflowKey?: string;
@@ -109,6 +111,7 @@ export interface CompletionNotification {
 		timedOut?: boolean;
 		stopped?: boolean;
 		turnBudgetExceeded?: boolean;
+		acceptance?: { status?: string };
 		watchdog?: ChildWatchdogProgress;
 	}>;
 	watchdog?: ChildWatchdogProgress;
@@ -347,6 +350,7 @@ export function formatSingleCompletion(details: SubagentNotifyDetails): string {
 		"",
 		scheduleLine,
 		scheduleLine ? "" : undefined,
+		...(details.acceptance?.status ? [`Acceptance: ${details.acceptance.status}`, ""] : []),
 		formatResultPreview(details),
 		...(watchdogLines.length ? ["", ...watchdogLines] : []),
 		details.handoffPath ? "" : undefined,
@@ -549,7 +553,7 @@ function completionBatchKey(result: CompletionNotification): string {
 }
 
 export function buildCompletionDetails(result: CompletionNotification): SubagentNotifyDetails {
-	const agent = result.agent ?? "unknown";
+	const explicitAgent = typeof result.agent === "string" && result.agent.trim() ? result.agent : undefined;
 	const summary = typeof result.summary === "string" ? result.summary : "";
 	const stopped = result.stopped === true
 		|| result.state === "stopped"
@@ -564,7 +568,7 @@ export function buildCompletionDetails(result: CompletionNotification): Subagent
 		|| summary.startsWith("Paused after interrupt.")
 	);
 	const status = stopped ? "stopped" : paused ? "paused" : result.success ? "completed" : "failed";
-	const runningChildren = (result.mode === "workflow" || agent === "workflow")
+	const runningChildren = (result.mode === "workflow" || explicitAgent === "workflow")
 		? result.results?.filter((child) => childStatus(child) === "running").length ?? 0 : 0;
 	const taskInfo = runningChildren > 0
 		? ` (${status === "completed" ? "dispatch complete; " : ""}${runningChildren} ${runningChildren === 1 ? "child" : "children"} running or uncollected)`
@@ -581,8 +585,12 @@ export function buildCompletionDetails(result: CompletionNotification): Subagent
 		? (receipt as Record<string, unknown>).path : undefined;
 	const workflowReceiptPath = typeof receiptPath === "string" && receiptPath ? receiptPath : undefined;
 	const rawRunId = typeof result.runId === "string" ? result.runId : typeof result.id === "string" ? result.id : undefined;
-	const workflowRunId = (result.mode === "workflow" || agent === "workflow") && rawRunId ? rawRunId : undefined;
+	const workflowRunId = (result.mode === "workflow" || explicitAgent === "workflow") && rawRunId ? rawRunId : undefined;
 	const directChild = !workflowRunId && result.results?.length === 1 ? result.results[0]! : undefined;
+	const agent = explicitAgent ?? (typeof directChild?.agent === "string" && directChild.agent.trim() ? directChild.agent : undefined) ?? "unknown";
+	const directAcceptance = Object.prototype.hasOwnProperty.call(result, "acceptance")
+		? result.acceptance
+		: directChild?.acceptance;
 	const directStructuredPreview = directChild
 		? childInlinePreview(directChild).preview
 		: undefined;
@@ -598,9 +606,18 @@ export function buildCompletionDetails(result: CompletionNotification): Subagent
 	const directNoOutputSummary = directChild && (!directSummary
 		|| directSummary === "(no output)"
 		|| (directAgent && directSummary === `${directAgent}:\n(no output)`));
-	const resultPreview = directStructuredPreview && (directNoOutputSummary || directDegenerateSummary)
-		? `Structured output:\n${directStructuredPreview}`
-		: summary;
+	const structured = result.structuredOutput && typeof result.structuredOutput === "object" && !Array.isArray(result.structuredOutput)
+		? result.structuredOutput as Record<string, unknown>
+		: undefined;
+	const structuredStatus = typeof structured?.status === "string" ? structured.status : undefined;
+	const structuredFailure = result.structuredOutputFailed === true && typeof result.error === "string" ? boundedSafeText(result.error) : undefined;
+	const resultPreview = structuredStatus === "MISSING" || structuredStatus === "PRESENT"
+		? `Structured outcome: ${structuredStatus}`
+		: structuredFailure
+			? structuredFailure
+			: directStructuredPreview && (directNoOutputSummary || directDegenerateSummary)
+				? `Structured output:\n${directStructuredPreview}`
+				: summary;
 	const childRuns = result.results?.flatMap((child) => {
 		const runId = typeof child.runId === "string" && child.runId.trim() ? child.runId.trim() : undefined;
 		const workflowKey = typeof child.workflowKey === "string" && child.workflowKey.trim() ? child.workflowKey.trim() : undefined;
@@ -672,6 +689,7 @@ export function buildCompletionDetails(result: CompletionNotification): Subagent
 		...(result.source ? { source: result.source } : {}),
 		...(taskInfo ? { taskInfo } : {}),
 		resultPreview: watchdogConcerns.length ? `${resultPreview}\n\nHigh-importance watchdog concerns:\n${watchdogConcerns.map((warning) => `- ${warning}`).join("\n")}` : resultPreview,
+		...(directAcceptance && typeof directAcceptance === "object" ? { acceptance: directAcceptance as { status?: string } } : {}),
 		...(typeof result.durationMs === "number" ? { durationMs: result.durationMs } : {}),
 		...(handoffPath ? { handoffPath } : {}),
 		...(workflowRunId ? { workflowRunId } : {}),

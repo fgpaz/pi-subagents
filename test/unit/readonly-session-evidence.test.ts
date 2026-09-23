@@ -47,7 +47,7 @@ it("ordinary startup fallback retains its fresh per-attempt timeout without a ca
 	const agent: AgentConfig = { name: "reader", description: "Read", systemPrompt: "Read", source: "project", filePath: "reader.md", model: "mock/timeout-a", fallbackModels: ["mock/timeout-b"] };
 	try {
 		const result = await runSync(process.cwd(), [agent], "reader", "Summarize", {
-			runId: "ordinary-startup-deadline", timeoutMs: 1000,
+			runId: "ordinary-startup-deadline",
 			childSessionFactory: {
 				async create() {
 					if (++creates === 1) { Date.now = () => start + 2000; throw new Error("503 service unavailable"); }

@@ -1811,9 +1811,10 @@ function captureParallelWorktreeDiffs(
 	asyncDir: string,
 	stepIndex: number,
 	group: Extract<RunnerStep, { parallel: SubagentStep[] }>,
+	outcomes: Array<{ runId?: string; parentWorkflowRunId?: string; workflowKey?: string; index?: number; agent?: string; exitCode?: number | null; error?: string; interrupted?: boolean; timedOut?: boolean; stopped?: boolean; detached?: boolean; structuredOutputFailed?: boolean; acceptance?: { status?: string } }> = [],
 ): { diffs: ReturnType<typeof diffWorktrees>; summary: string } {
 	const diffsDir = path.join(asyncDir, "worktree-diffs", `step-${stepIndex}`);
-	const diffs = diffWorktrees(worktreeSetup, group.parallel.map((task) => task.agent), diffsDir);
+	const diffs = diffWorktrees(worktreeSetup, group.parallel.map((task) => task.agent), diffsDir, outcomes);
 	return { diffs, summary: formatWorktreeDiffSummary(diffs) };
 }
 
@@ -4408,7 +4409,7 @@ export async function runSubagent(
 					const setup = worktreeSetup;
 					worktreeFinalized = true;
 					await finalizeWorktree(setup, stepIndex, groupStartFlatIndex, () => {
-						const captured = captureParallelWorktreeDiffs(setup, asyncDir, stepIndex, group);
+						const captured = captureParallelWorktreeDiffs(setup, asyncDir, stepIndex, group, parallelResults.map((result, index) => ({ ...result, runId: id, parentWorkflowRunId: config.parentWorkflowRunId, workflowKey: config.workflowKey, index, agent: group.parallel[index]!.agent })));
 						if (captured.summary) previousOutput = `${previousOutput}\n\n${captured.summary}`;
 						const manifestPath = parallelHandoffPath(asyncDir);
 						const handoff = {
@@ -4788,7 +4789,7 @@ export async function runSubagent(
 			if (singleWorktreeSetup && !singleResult.detached) {
 				const setup = singleWorktreeSetup;
 				await finalizeWorktree(setup, stepIndex, flatIndex, () => {
-					const diffs = diffWorktrees(setup, [seqStep.agent], path.join(asyncDir, "worktree-diffs", `step-${stepIndex}`));
+					const diffs = diffWorktrees(setup, [seqStep.agent], path.join(asyncDir, "worktree-diffs", `step-${stepIndex}`), [{ ...singleResult, runId: id, parentWorkflowRunId: config.parentWorkflowRunId, workflowKey: config.workflowKey, index: 0, agent: seqStep.agent }]);
 					const diffSummary = formatWorktreeDiffSummary(diffs);
 					const manifestPath = parallelHandoffPath(asyncDir);
 					const handoff = {

@@ -71,6 +71,9 @@ const NO_TOOL_INTENT_PATTERNS = [
 	/\bwithout using tools\b/i,
 	/\bdo not use tools\b/i,
 	/\bdon't use tools\b/i,
+	/\bdo not use other tools\b/i,
+	/\bdo not reread\b/i,
+	/\b(?:only|just)\s+(?:invoke|use)\s+(?:the\s+)?structured_output\b/i,
 ];
 
 const READ_ONLY_DELIVERABLE_PATTERNS = [
@@ -240,5 +243,9 @@ export function taskMayMutate(task: string): boolean {
 	const taskText = stripPatterns(stripSeverityCompounds(stripFrameworkInstructions(task)), [FINDING_CLASSIFICATION_PATTERN, ...SCOPED_NO_EDIT_CONSTRAINT_PATTERNS]);
 	const prohibitions = analyzeNoEditProhibitions(taskText);
 	if (prohibitions.blanket) return false;
+	// Reuse the classifier's clause-aware interpretation so a positive
+	// imperative after a scoped prohibition is not erased by the coordinated
+	// prohibition matcher (for example, "do not edit fixtures, but update the parser").
+	if (classifyTaskMutationIntent("worker", task).kind === "implementation") return true;
 	return MAY_MUTATE_VERB_PATTERN.test(stripPatterns(prohibitions.strippedText, READ_ONLY_DELIVERABLE_PATTERNS));
 }

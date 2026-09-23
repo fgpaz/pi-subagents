@@ -128,6 +128,7 @@ function childConfigLsp(value: unknown): WatchdogLspConfig {
 export function decodeChildWatchdogConfig(raw: string | undefined): ChildWatchdogConfig | undefined {
 	if (!raw) return undefined;
 	const parsed = childConfigObject(JSON.parse(raw), "root");
+	if ("fallbackModels" in parsed) throw new Error("Invalid child watchdog config: fallbackModels was removed; configure one model instead.");
 	if (parsed.enabled === false) return undefined;
 	if ("enabled" in parsed && parsed.enabled !== true) throw new Error("Invalid child watchdog config: enabled must be true or false.");
 	const thinking = parsed.thinking;

@@ -145,7 +145,7 @@ describe("profiles helpers", () => {
 		assert.equal(agents.some((agent) => agent.source === "builtin"), false);
 	});
 
-	it("rejects removed profile fallback models", () => {
+	it("retains valid profile fallback models and rejects mixed non-string values", () => {
 		const profilesDir = getSubagentProfilesDir();
 		fs.mkdirSync(profilesDir, { recursive: true });
 		fs.writeFileSync(path.join(profilesDir, "invalid.json"), JSON.stringify({
@@ -155,8 +155,15 @@ describe("profiles helpers", () => {
 				},
 			},
 		}, null, 2));
+		assert.throws(() => applySubagentProfile("invalid"), /invalid fallbackModels.*expected an array of strings or false/u);
 
-		assert.throws(() => applySubagentProfile("invalid"), /removed field fallbackModels/);
+		fs.writeFileSync(path.join(profilesDir, "valid.json"), JSON.stringify({
+			subagents: { agentOverrides: { worker: { fallbackModels: ["xai/grok-4.7:low"] } } },
+		}, null, 2));
+		applySubagentProfile("valid");
+		const settingsPath = path.join(homeDir, ".pi", "agent", "settings.json");
+		const written = JSON.parse(fs.readFileSync(settingsPath, "utf-8"));
+		assert.deepEqual(written.subagents.agentOverrides.worker.fallbackModels, ["xai/grok-4.7:low"]);
 	});
 
 	it("rejects profile and provider path traversal names", async () => {

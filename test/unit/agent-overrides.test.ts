@@ -131,18 +131,16 @@ describe("builtin agent overrides", () => {
 		assert.deepEqual(discoverAgents(tempProject, "both").agents.find((agent) => agent.name === "coordinator")?.allowedAgents, ["reviewer", "worker"]);
 	});
 
-	it("rejects removed fallbackModels in user agent overrides", () => {
+	it("retains configured fallbackModels and gives project overrides precedence", () => {
 		writeJson(path.join(tempHome, ".pi", "agent", "settings.json"), {
-			subagents: { agentOverrides: { worker: { fallbackModels: ["model/backup"] } } },
+			subagents: { agentOverrides: { worker: { fallbackModels: ["user/backup"] } } },
 		});
-		assert.throws(() => discoverAgentsAll(tempProject), /removed field 'fallbackModels'; configure one model instead/u);
-	});
+		assert.deepEqual(discoverAgentsAll(tempProject).builtin.find((agent) => agent.name === "worker")?.fallbackModels, ["user/backup"]);
 
-	it("rejects removed fallbackModels in project agent overrides", () => {
 		writeJson(path.join(tempProject, ".pi", "settings.json"), {
-			subagents: { agentOverrides: { worker: { fallbackModels: ["model/backup"] } } },
+			subagents: { agentOverrides: { worker: { fallbackModels: ["project/backup"] } } },
 		});
-		assert.throws(() => discoverAgentsAll(tempProject), /removed field 'fallbackModels'; configure one model instead/u);
+		assert.deepEqual(discoverAgentsAll(tempProject).builtin.find((agent) => agent.name === "worker")?.fallbackModels, ["project/backup"]);
 	});
 
 	it("lets a builtin agent inherit Pi's normal tools from an override", () => {

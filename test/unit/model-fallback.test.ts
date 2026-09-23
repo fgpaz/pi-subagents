@@ -500,6 +500,9 @@ describe("model fallback helpers", () => {
 		assert.equal(isRetryableModelFailure("Connection error"), true);
 		assert.equal(isRetryableModelFailure("APIConnectionError: Connection closed."), true);
 		assert.equal(isRetryableModelFailure("Connection reset by peer"), true);
+		for (const code of ["ECONNREFUSED", "ECONNRESET", "ENOTFOUND", "EAI_AGAIN"]) {
+			assert.equal(isRetryableModelFailure(`provider request failed: ${code}`), true, code);
+		}
 		assert.equal(isRetryableModelFailure("Request timed out."), true);
 		assert.equal(isRetryableModelFailure("internal server error"), true);
 		assert.equal(isRetryableModelFailure("500"), true);
@@ -522,6 +525,7 @@ describe("model fallback helpers", () => {
 		assert.equal(isRetryableModelFailure("bash failed (exit 1): requests.exceptions.ConnectionError: Connection error."), false);
 		assert.equal(isRetryableModelFailure("bash failed (exit 1): urllib.error.URLError: request timed out"), false);
 		assert.equal(isRetryableModelFailure("fetch_content failed with exit code 1"), false);
+		assert.equal(isRetryableModelFailure("fetch_content failed with exit code 1: request timed out"), false);
 		assert.equal(isRetryableModelFailure("mcp.server/write failed (exit 1): request timed out"), false);
 		assert.equal(isRetryableModelFailure("mcp:tools.search failed with exit code 1"), false);
 		assert.equal(isRetryableModelFailure("Provider error: bash failed (exit 1): request timed out"), true);

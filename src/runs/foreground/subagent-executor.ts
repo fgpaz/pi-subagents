@@ -65,6 +65,7 @@ import { formatSpawnBudget, getSpawnBudgetSnapshot, grantSpawnBudget, preflightS
 import { claimRunFanoutBatch, claimRunFanoutBatchWithCommit, createRunFanoutBudget, formatRunFanoutBudget, getRunFanoutBudgetSnapshot, readRunFanoutBudgetDescriptor, RunFanoutLimitError, writeRunFanoutBudgetDescriptor } from "../shared/run-fanout-budget.ts";
 import { retainLiveForegroundNestedRoute } from "../../integrations/pi-web-session-liveness.ts";
 import { validateToolBudgetConfig } from "../shared/tool-budget.ts";
+import { agentLooksMutationCapable, applyWriterBudgetPolicy } from "../shared/writer-budget-policy.ts";
 import { usageBudgetExceededMessage, usageBudgetState, validateUsageBudgetConfig } from "../shared/usage-budget.ts";
 import { intersectSubagentCapabilityCeilings, resolveCurrentSubagentCapabilityCeiling, type ResolvedSubagentCapabilityCeiling } from "../shared/capability-ceiling.ts";
 import { isAgentContract } from "../shared/agent-contract.ts";
@@ -2916,7 +2917,8 @@ function resolveToolBudget(
 	return { ...(resolved.budget === undefined ? {} : { toolBudget: resolved.budget }), ...(resolved.error === undefined ? {} : { error: resolved.error }) };
 }
 
-function resolveEffectiveToolBudget(input: { stepBudget?: ToolBudgetConfig; runBudget?: ResolvedToolBudget; agentBudget?: ToolBudgetConfig; configBudget?: ToolBudgetConfig }): { toolBudget?: ResolvedToolBudget; error?: string } {
+function resolveEffectiveToolBudget(input: { stepBudget?: ToolBudgetConfig; runBudget?: ResolvedToolBudget; agentBudget?: ToolBudgetConfig; configBudget?: ResolvedToolBudget; skipHardBudgets?: boolean }): { toolBudget?: ResolvedToolBudget; error?: string } {
+	if (input.skipHardBudgets) return {};
 	if (input.stepBudget !== undefined) return resolveToolBudget(input.stepBudget, "toolBudget");
 	if (input.runBudget !== undefined) return { toolBudget: input.runBudget };
 	if (input.agentBudget !== undefined) return resolveToolBudget(input.agentBudget, "agent.toolBudget");
@@ -3719,6 +3721,7 @@ async function finalizeSingleWorktreeHandoff(input: {
 	agent: string;
 	result: SingleResult;
 	workflowKey?: string;
+	parentWorkflowRunId?: string;
 	lane?: import("../../shared/types.ts").WorkflowLaneMetadata;
 }): Promise<{ suffix: string; reference?: NonNullable<Details["parallelHandoff"]> }> {
 	let admitted = false;
@@ -3726,7 +3729,7 @@ async function finalizeSingleWorktreeHandoff(input: {
 		return await withWorktreeTransaction(() => {
 			admitted = true;
 			const diffsDir = path.join(input.artifactsDir, "worktree-diffs", input.runId);
-			const diffs = diffWorktrees(input.worktreeSetup, [input.agent], diffsDir);
+			const diffs = diffWorktrees(input.worktreeSetup, [input.agent], diffsDir, [{ ...input.result, runId: input.runId, parentWorkflowRunId: input.parentWorkflowRunId, workflowKey: input.workflowKey, index: 0, agent: input.agent }]);
 			const diffSummary = formatWorktreeDiffSummary(diffs);
 			const manifestPath = parallelHandoffPath(input.artifactsDir, input.runId);
 			const handoff = {
@@ -3839,7 +3842,7 @@ async function runSinglePath(data: ExecutionContextData, deps: ExecutorDeps): Pr
 		try { foregroundMachine = resolveHerdrMachinePlacement({ machine: requestedMachine, cwd: ctx.cwd, stepCwd: params.machineCwd }).machine; }
 		catch (error) { return toExecutionErrorResult(params, error instanceof Error ? error : new Error(String(error)), data.contextPolicy.contextSummary); }
 	}
-	const effectiveToolBudget = resolveEffectiveToolBudget(omitUndefinedProperties({ runBudget: data.toolBudget, agentBudget: agentConfig.toolBudget, configBudget: data.configToolBudget }));
+	const effectiveToolBudget = resolveEffectiveToolBudget(omitUndefinedProperties({ runBudget: data.toolBudget, agentBudget: agentConfig.toolBudget, configBudget: data.configToolBudget, skipHardBudgets: agentLooksMutationCapable({ agentName: agentConfig.name, acceptanceRole: agentConfig.acceptanceRole, tools: agentConfig.tools, task: params.task }) }));
 	if (effectiveToolBudget.error) return toExecutionErrorResult(params, new Error(effectiveToolBudget.error), data.contextPolicy.contextSummary);
 
 	const parentModel = data.parentModel;
@@ -4092,7 +4095,7 @@ async function runSinglePath(data: ExecutionContextData, deps: ExecutorDeps): Pr
 				}
 				try {
 					if (worktreeSetup) {
-						await finalizeSingleWorktreeHandoff({ worktreeSetup, artifactsDir, runId, cwd: sourceCwd, agent: params.agent!, result, workflowKey: params.workflowKey, lane });
+						await finalizeSingleWorktreeHandoff({ worktreeSetup, artifactsDir, runId, cwd: sourceCwd, agent: params.agent!, result, workflowKey: params.workflowKey, parentWorkflowRunId: params.workflowParentRunId, lane });
 					}
 					try {
 						updateRememberedForegroundChild(deps.state, { runId, mode: "single", cwd: singleCwd, sessionId: data.parentSessionId, index: 0, result, events: deps.pi.events, notify: true });
@@ -4153,7 +4156,7 @@ async function runSinglePath(data: ExecutionContextData, deps: ExecutorDeps): Pr
 	if (worktreeSetup) {
 		worktreeHandoff = r.detached
 			? { suffix: pendingHandoff ? formatParallelHandoffReference(pendingHandoff) : "", reference: pendingHandoff }
-			: await finalizeSingleWorktreeHandoff({ worktreeSetup, artifactsDir, runId, cwd: sourceCwd, agent: params.agent!, result: r, workflowKey: params.workflowKey, lane });
+			: await finalizeSingleWorktreeHandoff({ worktreeSetup, artifactsDir, runId, cwd: sourceCwd, agent: params.agent!, result: r, workflowKey: params.workflowKey, parentWorkflowRunId: params.workflowParentRunId, lane });
 	}
 
 	if (r.progress) allProgress.push(r.progress);
@@ -6906,12 +6909,11 @@ export function createSubagentExecutor(deps: ExecutorDeps): {
 			depth,
 			deps.config.forceTopLevelAsync === true,
 		);
-		const runToolBudget = resolveToolBudget(
+		let runToolBudget = resolveToolBudget(
 			effectiveParams.toolBudget,
 			"toolBudget",
 			allowZeroToolBudget ? { minimumHard: 0 } : undefined,
 		);
-		if (runToolBudget.error) return buildRequestedModeError(effectiveParams, runToolBudget.error);
 		const configToolBudget = resolveToolBudget(deps.config.toolBudget, "config.toolBudget");
 		if (configToolBudget.error) return buildRequestedModeError(effectiveParams, configToolBudget.error);
 		const usageBudget = validateUsageBudgetConfig(effectiveParams.usageBudget ?? deps.config.usageBudget, effectiveParams.usageBudget ? "usageBudget" : "config.usageBudget");
@@ -6931,6 +6933,14 @@ export function createSubagentExecutor(deps: ExecutorDeps): {
 		}
 		const modelScope = discovered.modelScope;
 		effectiveParams = applySingleAgentLaunchDefaults(effectiveParams, discoveredAgents);
+		const writerBudgetPolicy = applyWriterBudgetPolicy(effectiveParams, discoveredAgents);
+		effectiveParams = writerBudgetPolicy.params;
+		runToolBudget = resolveToolBudget(
+			effectiveParams.toolBudget,
+			"toolBudget",
+			allowZeroToolBudget ? { minimumHard: 0 } : undefined,
+		);
+		if (runToolBudget.error) return buildRequestedModeError(effectiveParams, runToolBudget.error);
 		// The gate shorthand, an explicit acceptance.verify list, and an agent's
 		// defaultAcceptance all normalize to verify commands, and the agent's
 		// frontmatter outputSchema has been merged by now, so this one check keeps

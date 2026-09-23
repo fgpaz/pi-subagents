@@ -158,10 +158,10 @@ describe("async runner execution", () => {
 	it("resolves async step tool budgets with step over run over agent over config precedence", () => {
 		const result = buildAsyncRunnerSteps("run-1", {
 			chain: [
-				{ agent: "worker", task: "agent beats config" },
-				{ agent: "worker", task: "step beats run", toolBudget: { hard: 2, block: ["grep"] } },
+				{ agent: "budget-agent", task: "agent beats config" },
+				{ agent: "budget-agent", task: "step beats run", toolBudget: { hard: 2, block: ["grep"] } },
 			],
-			agents: [agent("worker", { hard: 4, block: ["read"] })],
+			agents: [{ ...agent("budget-agent", { hard: 4, block: ["read"] }), acceptanceRole: "read-only", tools: [] }],
 			ctx,
 			asyncDir: path.join(process.cwd(), ".tmp-async-test"),
 			maxSubagentDepth: 2,
@@ -227,8 +227,8 @@ describe("async runner execution", () => {
 
 	it("uses agent tool budget before config default when no run override exists", () => {
 		const result = buildAsyncRunnerSteps("run-2", {
-			chain: [{ agent: "worker", task: "agent beats config" }],
-			agents: [agent("worker", { hard: 4, block: ["read"] })],
+			chain: [{ agent: "budget-agent", task: "agent beats config" }],
+			agents: [{ ...agent("budget-agent", { hard: 4, block: ["read"] }), acceptanceRole: "read-only", tools: [] }],
 			ctx,
 			asyncDir: path.join(process.cwd(), ".tmp-async-test"),
 			maxSubagentDepth: 2,
@@ -268,8 +268,8 @@ describe("async runner execution", () => {
 
 	it("uses config default when no step, run, or agent budget exists", () => {
 		const result = buildAsyncRunnerSteps("run-3", {
-			chain: [{ agent: "worker", task: "config default" }],
-			agents: [agent("worker")],
+			chain: [{ agent: "budget-agent", task: "config default" }],
+			agents: [{ ...agent("budget-agent"), acceptanceRole: "read-only", tools: [] }],
 			ctx,
 			asyncDir: path.join(process.cwd(), ".tmp-async-test"),
 			maxSubagentDepth: 2,

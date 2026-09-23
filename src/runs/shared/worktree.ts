@@ -67,7 +67,425 @@ export interface WorktreeInfo {
 	naming?: WorktreeNaming;
 }
 
+const nativeRetainedSet = new WeakSet<WorktreeSetup>();
+
+interface NativeIndexSnapshot {
+  path: string;
+  exists: boolean;
+  bytes?: Buffer;
+  mode?: number;
+}
+function nativeCaptureGit(cwd: string, args: string[], indexPath?: string): GitResult {
+  const env = { ...process.env };
+  delete env.GIT_INDEX_FILE;
+  if (indexPath) env.GIT_INDEX_FILE = indexPath;
+  const result = spawnSync("git", ["-C", cwd, ...args], { encoding: "utf-8", windowsHide: true, shell: false, env });
+  return { stdout: result.stdout ?? "", stderr: result.stderr ?? "", status: result.status };
+}
+function nativeCaptureGitChecked(cwd: string, args: string[], indexPath: string): string {
+  const result = nativeCaptureGit(cwd, args, indexPath);
+  if (result.status !== 0) throw new Error(result.stderr.trim() || result.stdout.trim() || "git -C " + cwd + " " + args.join(" ") + " failed");
+  return result.stdout;
+}
+function nativeOwnedGit(cwd: string, args: string[]): GitResult {
+  // Parent/worktree ownership proofs must never inherit a caller's index.
+  return nativeCaptureGit(cwd, args);
+}
+function nativeOwnedGitChecked(cwd: string, args: string[]): string {
+  const result = nativeOwnedGit(cwd, args);
+  if (result.status !== 0) throw new Error(result.stderr.trim() || result.stdout.trim() || "git -C " + cwd + " " + args.join(" ") + " failed");
+  return result.stdout;
+}
+function nativeCaptureIndexPath(cwd: string): string {
+  const result = nativeCaptureGit(cwd, ["rev-parse", "--git-path", "index"]);
+  if (result.status !== 0) throw new Error(result.stderr.trim() || result.stdout.trim() || "cannot resolve worktree index");
+  const value = result.stdout.trim();
+  if (!value) throw new Error("worktree index path is empty");
+  return path.isAbsolute(value) ? value : path.resolve(cwd, value);
+}
+function nativeCaptureIndexSnapshot(cwd: string): NativeIndexSnapshot {
+  const indexPath = nativeCaptureIndexPath(cwd);
+  try {
+    const stat = fs.lstatSync(indexPath);
+    if (!stat.isFile() || stat.isSymbolicLink()) throw new Error("worktree index is not a regular file");
+    return { path: indexPath, exists: true, bytes: fs.readFileSync(indexPath), mode: stat.mode & 0o7777 };
+  } catch (error) {
+    if (error && typeof error === "object" && (error as NodeJS.ErrnoException).code === "ENOENT") return { path: indexPath, exists: false };
+    throw error;
+  }
+}
+function nativeCaptureAssertIndexUnchanged(snapshot: NativeIndexSnapshot): void {
+  try {
+    const stat = fs.lstatSync(snapshot.path);
+    if (!snapshot.exists || !stat.isFile() || stat.isSymbolicLink() || (stat.mode & 0o7777) !== snapshot.mode || !Buffer.from(fs.readFileSync(snapshot.path)).equals(snapshot.bytes!)) throw new Error("worktree index changed during native capture");
+  } catch (error) {
+    if (!snapshot.exists && error && typeof error === "object" && (error as NodeJS.ErrnoException).code === "ENOENT") return;
+    throw error;
+  }
+}
+function nativeValidateWorktreePatch(worktreePath: string, patchPath: string): string | undefined {
+  let temporaryDirectory: string | undefined;
+  try {
+    temporaryDirectory = fs.mkdtempSync(path.join(os.tmpdir(), "pi-native-validate-index-"));
+    const temporaryIndex = path.join(temporaryDirectory, "index");
+    nativeCaptureGitChecked(worktreePath, ["read-tree", "HEAD"], temporaryIndex);
+    nativeCaptureGitChecked(worktreePath, ["add", "-A"], temporaryIndex);
+    const result = nativeCaptureGit(worktreePath, [...PATCH_VALIDATION_OPTIONS, patchPath], temporaryIndex);
+    if (result.status === 0) return undefined;
+    return result.stderr.trim() || result.stdout.trim() || "git apply --check failed";
+  } catch (error) {
+    return error instanceof Error ? error.message : String(error);
+  } finally {
+    if (temporaryDirectory) try { fs.rmSync(temporaryDirectory, { recursive: true, force: true }); } catch {}
+  }
+}
+function nativeCaptureWorktreeDiff(setup: WorktreeSetup, worktree: WorktreeInfo, agent: string, patchPath: string): WorktreeDiff {
+  removeSyntheticPathsBeforeDiff(worktree);
+  const snapshot = nativeCaptureIndexSnapshot(worktree.path);
+  let temporaryDirectory: string | undefined;
+  try {
+    temporaryDirectory = fs.mkdtempSync(path.join(os.tmpdir(), "pi-native-capture-index-"));
+    const temporaryIndex = path.join(temporaryDirectory, "index");
+    // Seed from the declared base, not the caller-owned index. Add all then
+    // stages the complete worktree post-image while leaving staged/unstaged
+    // partitions in the real index untouched.
+    nativeCaptureGitChecked(worktree.path, ["read-tree", setup.baseCommit], temporaryIndex);
+    nativeCaptureGitChecked(worktree.path, ["add", "-A"], temporaryIndex);
+    const diffStat = nativeCaptureGitChecked(worktree.path, ["diff", "--cached", ...MACHINE_DIFF_OPTIONS, "--stat", setup.baseCommit], temporaryIndex).trim();
+    const patch = nativeCaptureGitChecked(worktree.path, ["diff", "--cached", ...MACHINE_PATCH_OPTIONS, setup.baseCommit], temporaryIndex);
+    const numstat = nativeCaptureGitChecked(worktree.path, ["diff", "--cached", ...MACHINE_DIFF_OPTIONS, "--numstat", setup.baseCommit], temporaryIndex);
+    const capturedPaths = nativeCaptureGitChecked(worktree.path, ["diff", "--cached", "--name-only", "-z", setup.baseCommit], temporaryIndex).split(String.fromCharCode(0)).filter(Boolean).map(nativePathKey);
+    fs.writeFileSync(patchPath, patch, "utf-8");
+    if (!patch.trim()) return emptyDiff(worktree.index, agent, worktree.branch, patchPath);
+    const validation = nativeCaptureGit(worktree.path, [...PATCH_VALIDATION_OPTIONS, patchPath], temporaryIndex);
+    if (validation.status !== 0) throw new Error("captured worktree patch is not machine-applyable: " + (validation.stderr.trim() || validation.stdout.trim() || "git apply --check failed"));
+    const parsed = parseNumstat(numstat);
+    return { index: worktree.index, agent, branch: worktree.branch, diffStat, filesChanged: parsed.filesChanged, insertions: parsed.insertions, deletions: parsed.deletions, patchPath, nativeChangedPaths: [...new Set(capturedPaths)] };
+  } finally {
+    try { nativeCaptureAssertIndexUnchanged(snapshot); } finally {
+      if (temporaryDirectory) try { fs.rmSync(temporaryDirectory, { recursive: true, force: true }); } catch {}
+    }
+  }
+}
+
+interface NativeChildOutcome {
+  runId?: string;
+  parentWorkflowRunId?: string;
+  workflowKey?: string;
+  index?: number;
+  agent?: string;
+  exitCode?: number | null;
+  error?: string;
+  interrupted?: boolean;
+  timedOut?: boolean;
+  stopped?: boolean;
+  detached?: boolean;
+  structuredOutputFailed?: boolean;
+  acceptance?: { status?: string; evidenceStatus?: string; report?: { status?: string }; ledger?: { status?: string; evidenceStatus?: string }; parentDecision?: { status?: string } };
+}
+
+interface NativeWorktreeReceipt {
+  schema: "mi-pi-native-worktree-receipt/v2";
+  runId: string;
+  taskIndex: number;
+  agent: string;
+  patchPath: string;
+  patchSha256: string;
+  execution: "completed" | "failed" | "cancelled" | "partial" | "aborted" | "timeout" | "unknown";
+  acceptance: "pending" | "not-required" | "claimed" | "attested" | "checked" | "verified" | "rejected" | "review-required" | "reviewed" | "accepted" | "unknown";
+  integration: "not-requested" | "pending" | "applied" | "conflict" | "rejected" | "retained" | "uncertain";
+  changedPaths: string[];
+  workspacePaths: string[];
+  workspacePath: string;
+  parentCwd: string;
+  parentRoot: string;
+  baseCommit: string;
+  lineageKey: string;
+  parentWorkflowRunId?: string;
+  workflowKey?: string;
+  parentFrontierBefore: string;
+  parentFrontierAfter?: string;
+  appliedPostImage?: string;
+  appliedOwnPostImage?: string;
+  parentIndexBefore?: string;
+  parentIndexAfter?: string;
+  reason?: string;
+  createdAt: string;
+}
+
+function nativePolicy(): "capture" | "integrate" {
+  const value = process.env.MI_PI_NATIVE_ISOLATION_POLICY ?? process.env.PI_SUBAGENTS_NATIVE_ISOLATION_POLICY ?? "capture";
+  return value === "integrate" ? "integrate" : "capture";
+}
+function nativePathKey(value: string): string {
+  const normalized = value.replaceAll("\\", "/").replace(/^\.\//, "");
+  return process.platform === "win32" ? normalized.toLowerCase() : normalized;
+}
+function nativeParentIndex(cwd: string): string {
+  const head = nativeOwnedGit(cwd, ["rev-parse", "HEAD"]);
+  const staged = nativeOwnedGit(cwd, ["diff", "--cached", "--binary", "--full-index", "--no-ext-diff", "--no-textconv", "--"]);
+  if ([head, staged].some((result) => result.status !== 0)) throw new Error("cannot prove parent index");
+  return createHash("sha256").update(JSON.stringify({ head: head.stdout.trim(), staged: staged.stdout }), "utf8").digest("hex");
+}
+function nativeParentFrontier(cwd: string): string {
+  const head = nativeOwnedGit(cwd, ["rev-parse", "HEAD"]);
+  const status = nativeOwnedGit(cwd, ["status", "--porcelain=v1", "-z", "--untracked-files=all"]);
+  const staged = nativeOwnedGit(cwd, ["diff", "--cached", "--binary", "--full-index", "--no-ext-diff", "--no-textconv", "--"]);
+  const worktree = nativeOwnedGit(cwd, ["diff", "--binary", "--full-index", "--no-ext-diff", "--no-textconv", "--"]);
+  if ([head, status, staged, worktree].some((result) => result.status !== 0)) throw new Error("cannot prove parent frontier");
+  return createHash("sha256").update(JSON.stringify({ head: head.stdout.trim(), status: status.stdout, staged: staged.stdout, worktree: worktree.stdout }), "utf8").digest("hex");
+}
+function nativeStatusPaths(cwd: string): string[] | undefined {
+  const result = nativeOwnedGit(cwd, ["status", "--porcelain=v1", "-z", "--untracked-files=all"]);
+  if (result.status !== 0) return undefined;
+  const tokens = result.stdout.split("\0");
+  const paths: string[] = [];
+  for (let index = 0; index < tokens.length; index++) {
+    const token = tokens[index];
+    if (!token) continue;
+    const status = token.slice(0, 2);
+    const value = token.slice(3);
+    if (value) paths.push(nativePathKey(value));
+    if (/[RC]/.test(status) && tokens[index + 1]) paths.push(nativePathKey(tokens[++index]!));
+  }
+  return [...new Set(paths)];
+}
+function nativeChangedPaths(setup: WorktreeSetup, diff: WorktreeDiff): string[] {
+  if (!Number.isInteger(diff.index) || diff.index < 0 || diff.index >= setup.worktrees.length) return [];
+  const worktree = setup.worktrees[diff.index];
+  if (!worktree) return [];
+  const result = nativeOwnedGit(worktree.path, ["diff", "--cached", "--name-only", "-z", setup.baseCommit]);
+  if (result.status !== 0) return [];
+  return [...new Set(result.stdout.split("\0").filter(Boolean).map(nativePathKey))];
+}
+function nativeOwnPostImage(cwd: string, changedPaths: string[]): string | undefined {
+  try {
+    const image = changedPaths.slice().sort().map((relative) => {
+      const absolute = path.resolve(cwd, ...relative.split("/"));
+      const relativeCheck = path.relative(path.resolve(cwd), absolute);
+      if (relativeCheck.startsWith("..") || path.isAbsolute(relativeCheck)) throw new Error("changed path escapes parent root");
+      let stat;
+      try { stat = fs.lstatSync(absolute); } catch { return { path: relative, kind: "missing" }; }
+      if (stat.isSymbolicLink()) return { path: relative, kind: "symlink", mode: stat.mode & 0o7777, target: fs.readlinkSync(absolute) };
+      if (!stat.isFile()) throw new Error("unsupported changed path type: " + relative);
+      return { path: relative, kind: "file", mode: stat.mode & 0o7777, sha256: createHash("sha256").update(fs.readFileSync(absolute)).digest("hex") };
+    });
+    return createHash("sha256").update(JSON.stringify(image), "utf8").digest("hex");
+  } catch {
+    return undefined;
+  }
+}
+function nativeReadReceipt(filePath: string): { receipt?: NativeWorktreeReceipt; exists: boolean; corrupt: boolean } {
+  if (!fs.existsSync(filePath)) return { exists: false, corrupt: false };
+  try {
+    const value = JSON.parse(fs.readFileSync(filePath, "utf8"));
+    if (!value || typeof value !== "object" || Array.isArray(value)) return { exists: true, corrupt: true };
+    return { receipt: value as NativeWorktreeReceipt, exists: true, corrupt: false };
+  } catch { return { exists: true, corrupt: true }; }
+}
+function nativeWorkspaceRoot(setup: WorktreeSetup): string | undefined {
+  const paths = setup.worktrees.map((worktree) => path.resolve(worktree.path));
+  if (!paths.length) return undefined;
+  const roots = new Set(paths.map((worktreePath) => path.dirname(worktreePath)));
+  return roots.size === 1 ? [...roots][0] : undefined;
+}
+function nativeArtifactRoot(receiptPath: string): string {
+  const directory = path.dirname(path.resolve(receiptPath));
+  return path.basename(path.dirname(directory)) === "worktree-diffs" ? path.dirname(directory) : directory;
+}
+// A workflow child must carry the parent/key pair; root runs carry neither and use runId.
+function nativeIdentityPairValid(identity: { runId?: string; parentWorkflowRunId?: string; workflowKey?: string } = {}): boolean {
+  const parentProvided = identity.parentWorkflowRunId !== undefined;
+  const keyProvided = identity.workflowKey !== undefined;
+  if (parentProvided !== keyProvided) return false;
+  if (!parentProvided) return identity.parentWorkflowRunId === undefined && identity.workflowKey === undefined;
+  return typeof identity.parentWorkflowRunId === "string" && Boolean(identity.parentWorkflowRunId.trim()) && typeof identity.workflowKey === "string" && Boolean(identity.workflowKey.trim());
+}
+function nativeWorkflowDomain(identity: { runId?: string; parentWorkflowRunId?: string; workflowKey?: string } = {}): string {
+  if (!nativeIdentityPairValid(identity) || typeof identity.runId !== "string" || !identity.runId.trim()) return "";
+  return identity.parentWorkflowRunId !== undefined ? `workflow:${identity.parentWorkflowRunId}` : `run:${identity.runId}`;
+}
+// workflowKey is receipt-own lane identity, so it is deliberately absent from shared-domain authorization.
+function nativeLineageDigest(parentRoot: string, parentCwd: string, baseCommit: string, workspaceRoot: string, artifactRoot: string, identity: { runId?: string; parentWorkflowRunId?: string; workflowKey?: string } = {}): string {
+  return createHash("sha256").update(JSON.stringify({
+    parentRoot: nativePathKey(parentRoot),
+    parentCwd: nativePathKey(path.resolve(parentCwd)),
+    baseCommit,
+    workspaceRoot: nativePathKey(workspaceRoot),
+    artifactRoot: nativePathKey(artifactRoot),
+    workflowDomain: nativeWorkflowDomain(identity),
+  }), "utf8").digest("hex");
+}
+function nativeLineageKey(receiptPath: string, setup: WorktreeSetup, identity: { runId?: string; parentWorkflowRunId?: string; workflowKey?: string } = {}): string {
+  const parentRoot = (nativeOwnedGit(setup.cwd, ["rev-parse", "--show-toplevel"]).stdout || "").trim();
+  const workspaceRoot = nativeWorkspaceRoot(setup);
+  if (!parentRoot || !workspaceRoot) return "";
+  return nativeLineageDigest(parentRoot, setup.cwd, setup.baseCommit, workspaceRoot, nativeArtifactRoot(receiptPath), identity);
+}
+function nativeReceiptProof(receipt: NativeWorktreeReceipt, setup: WorktreeSetup, contextReceiptPath: string, identity: { runId?: string; parentWorkflowRunId?: string; workflowKey?: string } = {}): boolean {
+  const accepted = ["not-required", "attested", "checked", "verified", "reviewed", "accepted"];
+  const workspaceRoot = nativeWorkspaceRoot(setup);
+  const candidateWorkspaceRoot = typeof receipt.workspacePath === "string" ? path.dirname(path.resolve(receipt.workspacePath)) : undefined;
+  if (receipt.schema !== "mi-pi-native-worktree-receipt/v2" || receipt.integration !== "applied" || receipt.execution !== "completed" || !accepted.includes(receipt.acceptance) || typeof receipt.runId !== "string" || !receipt.runId.trim() || !Number.isInteger(receipt.taskIndex) || receipt.taskIndex < 0 || !Array.isArray(receipt.workspacePaths) || receipt.taskIndex >= receipt.workspacePaths.length || typeof receipt.agent !== "string" || !receipt.agent.trim() || typeof receipt.patchPath !== "string" || typeof receipt.patchSha256 !== "string" || typeof receipt.appliedOwnPostImage !== "string" || typeof receipt.lineageKey !== "string" || !nativeIdentityPairValid(receipt) || !nativeIdentityPairValid(identity) || !nativeWorkflowDomain(receipt) || nativeWorkflowDomain(receipt) !== nativeWorkflowDomain(identity) || receipt.lineageKey !== nativeLineageKey(contextReceiptPath, setup, identity) || !candidateWorkspaceRoot || typeof receipt.parentCwd !== "string" || typeof receipt.parentRoot !== "string" || receipt.lineageKey !== nativeLineageDigest(receipt.parentRoot, receipt.parentCwd, receipt.baseCommit, candidateWorkspaceRoot, nativeArtifactRoot(nativeReceiptPath(receipt.patchPath)), receipt) || !Array.isArray(receipt.changedPaths) || !receipt.changedPaths.every((candidate) => typeof candidate === "string") || !receipt.workspacePaths.every((candidate) => typeof candidate === "string") || typeof receipt.workspacePath !== "string" || !receipt.workspacePath || !candidateWorkspaceRoot || !workspaceRoot || nativePathKey(candidateWorkspaceRoot) !== nativePathKey(workspaceRoot) || !receipt.workspacePaths.some((candidate) => nativePathKey(candidate) === nativePathKey(receipt.workspacePath)) || typeof receipt.parentCwd !== "string" || !receipt.parentCwd || typeof receipt.parentRoot !== "string" || !receipt.parentRoot || receipt.baseCommit !== setup.baseCommit) return false;
+  const root = (nativeOwnedGit(setup.cwd, ["rev-parse", "--show-toplevel"]).stdout || setup.cwd).trim();
+  if (nativePathKey(receipt.parentRoot) !== nativePathKey(root) || nativePathKey(receipt.parentCwd) !== nativePathKey(setup.cwd)) return false;
+  if (!fs.existsSync(receipt.patchPath)) return false;
+  try { return createHash("sha256").update(fs.readFileSync(receipt.patchPath)).digest("hex") === receipt.patchSha256 && nativeOwnPostImage(setup.cwd, receipt.changedPaths) === receipt.appliedOwnPostImage; }
+  catch { return false; }
+}
+function nativeAuthorizedAppliedReceipts(receiptPath: string, setup: WorktreeSetup, identity: { runId?: string; parentWorkflowRunId?: string; workflowKey?: string } = {}): NativeWorktreeReceipt[] | undefined {
+  try {
+    const directory = path.dirname(receiptPath);
+    const artifactRoot = nativeArtifactRoot(receiptPath);
+    const directories = [directory];
+    if (artifactRoot !== directory && path.basename(artifactRoot) === "worktree-diffs") {
+      for (const entry of fs.readdirSync(artifactRoot, { withFileTypes: true })) {
+        if (entry.isDirectory()) directories.push(path.join(artifactRoot, entry.name));
+      }
+    }
+    const receipts: NativeWorktreeReceipt[] = [];
+    for (const candidateDirectory of [...new Set(directories)]) {
+      for (const name of fs.readdirSync(candidateDirectory)) {
+        if (!name.endsWith(".receipt.json")) continue;
+        const candidatePath = path.join(candidateDirectory, name);
+        const candidate = nativeReadReceipt(candidatePath).receipt;
+        if (!candidate || nativeReceiptPath(candidate.patchPath) !== candidatePath || !nativeReceiptProof(candidate, setup, receiptPath, identity)) continue;
+        receipts.push(candidate);
+      }
+    }
+    return receipts;
+  } catch { return undefined; }
+}
+function nativeFrontierProgressionAllowed(setup: WorktreeSetup, receiptPath: string, changedPaths: string[], parentIndexAfter: string, identity: { runId?: string; parentWorkflowRunId?: string; workflowKey?: string } = {}): boolean {
+  if (nativeOwnedGit(setup.cwd, ["rev-parse", "HEAD"]).stdout.trim() !== setup.baseCommit) return false;
+  let currentIndex: string;
+  try { currentIndex = nativeParentIndex(setup.cwd); } catch { return false; }
+  if (currentIndex !== parentIndexAfter) return false;
+  const currentPaths = nativeStatusPaths(setup.cwd);
+  const authorized = nativeAuthorizedAppliedReceipts(receiptPath, setup, identity);
+  if (!currentPaths || !authorized) return false;
+  const allowed = new Set<string>();
+  for (const candidate of authorized) for (const changedPath of candidate.changedPaths) allowed.add(nativePathKey(changedPath));
+  return currentPaths.every((currentPath) => allowed.has(currentPath));
+}
+function nativeAcceptance(outcome?: NativeChildOutcome): NativeWorktreeReceipt["acceptance"] {
+  const value = outcome?.acceptance?.status ?? outcome?.acceptance?.evidenceStatus ?? outcome?.acceptance?.report?.status ?? outcome?.acceptance?.ledger?.status ?? outcome?.acceptance?.ledger?.evidenceStatus ?? outcome?.acceptance?.parentDecision?.status;
+  const allowed = ["pending", "not-required", "claimed", "attested", "checked", "verified", "rejected", "review-required", "reviewed", "accepted", "unknown"];
+  return typeof value === "string" && allowed.includes(value) ? value as NativeWorktreeReceipt["acceptance"] : "unknown";
+}
+function nativeExecution(outcome?: NativeChildOutcome): NativeWorktreeReceipt["execution"] {
+  if (!outcome) return "unknown";
+  if (outcome.timedOut) return "timeout";
+  if (outcome.interrupted || outcome.stopped) return "cancelled";
+  if (outcome.detached) return "aborted";
+  if (outcome.exitCode === 0 && !outcome.error && !outcome.structuredOutputFailed) return "completed";
+  if (outcome.exitCode === null || outcome.exitCode === undefined) return "unknown";
+  return "failed";
+}
+function nativeReceiptPath(patchPath: string): string { return `${patchPath}.receipt.json`; }
+function nativeWriteReceipt(filePath: string, receipt: NativeWorktreeReceipt): void {
+  fs.mkdirSync(path.dirname(filePath), { recursive: true });
+  const temporary = `${filePath}.${process.pid}.tmp`;
+  const fd = fs.openSync(temporary, "wx", 0o600);
+  try { fs.writeFileSync(fd, `${JSON.stringify(receipt, null, 2)}\n`, "utf8"); fs.fsyncSync(fd); }
+  finally { fs.closeSync(fd); }
+  try { fs.renameSync(temporary, filePath); } catch (error) { try { fs.rmSync(temporary, { force: true }); } catch {} throw error; }
+}
+function nativeLock(setup: WorktreeSetup): { fd: number; path: string } | undefined {
+  const result = nativeOwnedGit(setup.cwd, ["rev-parse", "--git-path", "mi-pi-native-integration.lock"]);
+  if (result.status !== 0) return undefined;
+  const lockPath = path.resolve(setup.cwd, result.stdout.trim());
+  try { return { fd: fs.openSync(lockPath, "wx", 0o600), path: lockPath }; } catch { return undefined; }
+}
+function nativeFinalizeWorktreeDiff(setup: WorktreeSetup, diff: WorktreeDiff, outcome?: NativeChildOutcome): WorktreeDiff {
+  const changedPaths = diff.nativeChangedPaths ?? nativeChangedPaths(setup, diff);
+  const execution = nativeExecution(outcome);
+  const acceptance = nativeAcceptance(outcome);
+  const patchSha256 = fs.existsSync(diff.patchPath) ? createHash("sha256").update(fs.readFileSync(diff.patchPath)).digest("hex") : "";
+  let parentFrontierBefore = "unknown";
+  let parentIndexBefore = "unknown";
+  try { parentFrontierBefore = nativeParentFrontier(setup.cwd); parentIndexBefore = nativeParentIndex(setup.cwd); } catch {}
+  const index = outcome && Number.isInteger(outcome.index) ? outcome.index! : diff.index;
+  const workspacePath = setup.worktrees[index]?.path ?? "";
+  const parentRoot = (nativeOwnedGit(setup.cwd, ["rev-parse", "--show-toplevel"]).stdout || setup.cwd).trim();
+  const receiptPath = nativeReceiptPath(diff.patchPath);
+  const identity = { runId: outcome?.runId, parentWorkflowRunId: outcome?.parentWorkflowRunId, workflowKey: outcome?.workflowKey };
+  const lineageKey = nativeLineageKey(receiptPath, setup, identity);
+  const base: NativeWorktreeReceipt = { schema: "mi-pi-native-worktree-receipt/v2", runId: outcome?.runId ?? "", taskIndex: index, agent: outcome?.agent ?? diff.agent, patchPath: diff.patchPath, patchSha256, execution, acceptance, integration: "not-requested", changedPaths, workspacePaths: setup.worktrees.map((item) => item.path), workspacePath, parentCwd: setup.cwd, parentRoot, baseCommit: setup.baseCommit, lineageKey, ...(outcome?.parentWorkflowRunId !== undefined ? { parentWorkflowRunId: outcome.parentWorkflowRunId } : {}), ...(outcome?.workflowKey !== undefined ? { workflowKey: outcome.workflowKey } : {}), parentFrontierBefore, parentIndexBefore, createdAt: new Date().toISOString() };
+  const priorState = nativeReadReceipt(receiptPath);
+  const prior = priorState.receipt;
+  const priorChangedPaths = prior && Array.isArray(prior.changedPaths) && prior.changedPaths.every((candidate) => typeof candidate === "string") ? prior.changedPaths.map(nativePathKey).sort() : undefined;
+  const identityValid = Boolean(base.runId.trim() && base.taskIndex >= 0 && base.taskIndex < setup.worktrees.length && base.taskIndex === diff.index && base.agent.trim() && base.workspacePath && lineageKey && nativeIdentityPairValid(base) && nativeWorkflowDomain(base));
+  const sameIdentity = Boolean(prior && priorChangedPaths && nativeIdentityPairValid(prior) && nativeIdentityPairValid(base) && prior.schema === base.schema && prior.runId === base.runId && prior.taskIndex === base.taskIndex && prior.taskIndex === diff.index && prior.agent === base.agent && prior.patchPath === base.patchPath && prior.patchSha256 === base.patchSha256 && prior.baseCommit === base.baseCommit && prior.parentWorkflowRunId === base.parentWorkflowRunId && prior.workflowKey === base.workflowKey && prior.lineageKey === base.lineageKey && typeof prior.parentRoot === "string" && typeof prior.workspacePath === "string" && nativePathKey(prior.parentRoot) === nativePathKey(base.parentRoot) && nativePathKey(prior.workspacePath) === nativePathKey(base.workspacePath) && JSON.stringify(priorChangedPaths) === JSON.stringify(changedPaths.slice().sort()));
+  const eligible = execution === "completed" && ["not-required", "attested", "checked", "verified", "reviewed", "accepted"].includes(acceptance) && parentFrontierBefore !== "unknown" && parentIndexBefore !== "unknown";
+  const retainPrior = (reason: string, integration: "retained" | "uncertain" = "uncertain"): WorktreeDiff => {
+    nativeRetainedSet.add(setup);
+    return { ...diff, integration, execution: prior?.execution ?? execution, acceptance: prior?.acceptance ?? acceptance, receiptPath, error: reason };
+  };
+  if (priorState.corrupt) return retainPrior("native receipt is corrupt");
+  if (prior) {
+    if (!sameIdentity) return retainPrior("native receipt identity or captured patch changed; prior evidence retained", "retained");
+    if (prior.integration === "applied") {
+      const proof = eligible && prior.execution === execution && prior.acceptance === acceptance && nativeReceiptProof(prior, setup, receiptPath, identity) && nativeOwnPostImage(setup.cwd, changedPaths) === prior.appliedOwnPostImage && nativeFrontierProgressionAllowed(setup, receiptPath, changedPaths, prior.parentIndexAfter ?? "unknown", identity);
+      if (proof) return { ...diff, integration: "applied", execution: prior.execution, acceptance: prior.acceptance, receiptPath };
+      return retainPrior("previous applied receipt proof is missing or parent frontier is unauthorized");
+    }
+    return retainPrior("previous native outcome is immutable and does not authorize re-apply");
+  }
+  if (!eligible || !identityValid || diff.error) {
+    const retained = { ...base, integration: changedPaths.length ? "retained" as const : "not-requested" as const, reason: !identityValid ? "missing native child identity" : "child execution or acceptance is not eligible for integration" };
+    nativeWriteReceipt(receiptPath, retained);
+    return { ...diff, integration: retained.integration, execution: retained.execution, acceptance: retained.acceptance, receiptPath };
+  }
+  if (!changedPaths.length || nativePolicy() === "capture") {
+    const retained = { ...base, integration: changedPaths.length ? "retained" as const : "not-requested" as const, reason: changedPaths.length ? "capture-only policy; explicit integration is required" : undefined };
+    nativeWriteReceipt(receiptPath, retained);
+    return { ...diff, integration: retained.integration, execution: retained.execution, acceptance: retained.acceptance, receiptPath };
+  }
+  if (!nativeFrontierProgressionAllowed(setup, receiptPath, changedPaths, parentIndexBefore, identity)) {
+    nativeRetainedSet.add(setup);
+    const retained = { ...base, integration: "retained" as const, reason: "native receipt context cannot authorize current parent frontier" };
+    nativeWriteReceipt(receiptPath, retained);
+    return { ...diff, integration: retained.integration, execution: retained.execution, acceptance: retained.acceptance, receiptPath };
+  }
+  const lock = nativeLock(setup);
+  if (!lock) {
+    nativeRetainedSet.add(setup);
+    const retained = { ...base, integration: "retained" as const, reason: "native integration lock is held or unavailable" };
+    nativeWriteReceipt(receiptPath, retained);
+    return { ...diff, integration: retained.integration, execution: retained.execution, acceptance: retained.acceptance, receiptPath };
+  }
+  let receipt: NativeWorktreeReceipt = { ...base, integration: "pending" };
+  nativeWriteReceipt(receiptPath, receipt);
+  try {
+    if (nativeOwnedGitChecked(setup.cwd, ["rev-parse", "HEAD"]).trim() !== setup.baseCommit) throw new Error("parent HEAD changed after writer launch");
+    const currentFrontier = nativeParentFrontier(setup.cwd);
+    if (currentFrontier === "unknown" || (currentFrontier !== base.parentFrontierBefore && !nativeFrontierProgressionAllowed(setup, receiptPath, changedPaths, parentIndexBefore, identity))) throw new Error("parent index/content frontier changed before native integration");
+    const checked = nativeOwnedGit(setup.cwd, ["apply", "--check", "--binary", diff.patchPath]);
+    if (checked.status !== 0) throw new Error(checked.stderr.trim() || "native patch conflict or parent frontier drift");
+    const applied = nativeOwnedGit(setup.cwd, ["apply", "--binary", diff.patchPath]);
+    if (applied.status !== 0) throw new Error(applied.stderr.trim() || "native patch apply failed");
+    const appliedOwnPostImage = nativeOwnPostImage(setup.cwd, changedPaths);
+    if (!appliedOwnPostImage) throw new Error("cannot prove native applied own post-image");
+    const parentFrontierAfter = nativeParentFrontier(setup.cwd);
+    const parentIndexAfter = nativeParentIndex(setup.cwd);
+    if (parentIndexAfter !== parentIndexBefore) throw new Error("parent index changed during native integration");
+    receipt = { ...base, integration: "applied", parentFrontierAfter, appliedPostImage: parentFrontierAfter, appliedOwnPostImage, parentIndexAfter };
+    nativeWriteReceipt(receiptPath, receipt);
+  } catch (error) {
+    nativeRetainedSet.add(setup);
+    receipt = { ...base, integration: "conflict", reason: error instanceof Error ? error.message : String(error) };
+    try { nativeWriteReceipt(receiptPath, receipt); } catch {}
+  } finally { try { fs.closeSync(lock.fd); } catch {} try { fs.rmSync(lock.path, { force: true }); } catch {} }
+  return { ...diff, integration: receipt.integration, execution: receipt.execution, acceptance: receipt.acceptance, receiptPath };
+}
+
 export interface WorktreeDiff {
+	nativeChangedPaths?: string[];
+	integration?: NativeWorktreeReceipt["integration"];
+	execution?: NativeWorktreeReceipt["execution"];
+	acceptance?: NativeWorktreeReceipt["acceptance"];
+	receiptPath?: string;
 	index: number;
 	agent: string;
 	branch: string;
@@ -295,9 +713,7 @@ function runGitChecked(cwd: string, args: string[]): string {
 
 /** Validate a captured patch against the worktree index without changing either. */
 export function validateWorktreePatch(worktreePath: string, patchPath: string): string | undefined {
-	const result = runGit(worktreePath, [...PATCH_VALIDATION_OPTIONS, patchPath]);
-	if (result.status === 0) return undefined;
-	return result.stderr.trim() || result.stdout.trim() || `git -C ${worktreePath} apply --check failed`;
+	return nativeValidateWorktreePatch(worktreePath, patchPath);
 }
 
 function currentWorktreePatch(worktreePath: string, baseCommit: string): { patch: string } | { error: string } {
@@ -1115,31 +1531,7 @@ function captureWorktreeDiff(
 	agent: string,
 	patchPath: string,
 ): WorktreeDiff {
-	removeSyntheticPathsBeforeDiff(worktree);
-	runGitChecked(worktree.path, ["add", "-A"]);
-	const diffStat = runGitChecked(worktree.path, ["diff", "--cached", ...MACHINE_DIFF_OPTIONS, "--stat", setup.baseCommit]).trim();
-	const patch = runGitChecked(worktree.path, ["diff", "--cached", ...MACHINE_PATCH_OPTIONS, setup.baseCommit]);
-	const numstat = runGitChecked(worktree.path, ["diff", "--cached", ...MACHINE_DIFF_OPTIONS, "--numstat", setup.baseCommit]);
-	fs.writeFileSync(patchPath, patch, "utf-8");
-
-	if (!patch.trim()) {
-		return emptyDiff(worktree.index, agent, worktree.branch, patchPath);
-	}
-
-	const validationError = validateWorktreePatch(worktree.path, patchPath);
-	if (validationError) throw new Error(`captured worktree patch is not machine-applyable: ${validationError}`);
-
-	const parsed = parseNumstat(numstat);
-	return {
-		index: worktree.index,
-		agent,
-		branch: worktree.branch,
-		diffStat,
-		filesChanged: parsed.filesChanged,
-		insertions: parsed.insertions,
-		deletions: parsed.deletions,
-		patchPath,
-	};
+	return nativeCaptureWorktreeDiff(setup, worktree, agent, patchPath);
 }
 
 function writeEmptyPatch(patchPath: string): void {
@@ -1463,7 +1855,7 @@ export async function createWorktrees(cwd: string, runId: string, count: number,
 	}
 }
 
-export function diffWorktrees(setup: WorktreeSetup, agents: string[], diffsDir: string): WorktreeDiff[] {
+export function diffWorktrees(setup: WorktreeSetup, agents: string[], diffsDir: string, outcomes: NativeChildOutcome[] = []): WorktreeDiff[] {
 	assertWorktreeMutationAllowed();
 	try {
 		fs.mkdirSync(diffsDir, { recursive: true });
@@ -1478,7 +1870,9 @@ export function diffWorktrees(setup: WorktreeSetup, agents: string[], diffsDir: 
 		const agent = agents[index] ?? `task-${index + 1}`;
 		const patchPath = path.join(diffsDir, `task-${index}-${safePatchAgentName(agent)}.patch`);
 		try {
-			diffs.push(captureWorktreeDiff(setup, worktree, agent, patchPath));
+			const captured = captureWorktreeDiff(setup, worktree, agent, patchPath);
+			const outcome = outcomes[index];
+			diffs.push(outcome ? nativeFinalizeWorktreeDiff(setup, captured, outcome) : captured);
 		} catch (error) {
 			// Preserve execution flow while retaining the failed capture as handoff evidence.
 			writeEmptyPatch(patchPath);
@@ -1495,6 +1889,7 @@ export function cleanupWorktrees(
 	intent: WorktreeCleanupIntent = { kind: "preserve", ...(setup.capturedDiffs ? { capturedDiffs: setup.capturedDiffs } : {}) },
 ): WorktreeCleanupReport {
 	assertWorktreeMutationAllowed();
+	if (nativeRetainedSet.has(setup)) return { state: "partial", tasks: setup.worktrees.map((worktree) => ({ index: worktree.index, path: worktree.path, branch: worktree.branch, provider: worktree.provider, naming: worktree.naming, worktreeRemoved: false, branchRemoved: false, preserved: true, reason: "native recovery artifact retained" })), pruned: false, errors: ["native recovery artifact retained until explicit disposition"] };
 	const tasks: WorktreeCleanupTask[] = [];
 	for (let index = setup.worktrees.length - 1; index >= 0; index--) {
 		tasks.push(cleanupSingleWorktree(setup, setup.worktrees[index]!, intent));

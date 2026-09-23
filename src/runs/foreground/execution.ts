@@ -65,7 +65,7 @@ import { deriveChildSessionName } from "../../shared/child-session-name.ts";
 import { assertAgentAllowedByCapabilityCeiling, intersectSubagentCapabilityCeilings, resolveCurrentSubagentCapabilityCeiling } from "../shared/capability-ceiling.ts";
 import { resolveEffectiveThinking } from "../../shared/model-info.ts";
 import { assertThinkingWithinCeiling, intersectThinkingCeilings } from "../../shared/thinking-ceiling.ts";
-import { MISSING_STRUCTURED_ACCEPTANCE_REPORT_ERROR, MISSING_STRUCTURED_OUTPUT_CALL_ERROR } from "../shared/structured-output.ts";
+import { MISSING_STRUCTURED_ACCEPTANCE_REPORT_ERROR, MISSING_STRUCTURED_OUTPUT_CALL_ERROR, validateStructuredOutputValue } from "../shared/structured-output.ts";
 import { formatMidToolExitError, isOrdinaryToolForMidToolExit } from "../shared/process-signal.ts";
 import { formatChildToolDiagnostic } from "../shared/tool-availability.ts";
 import { formatChildModelResolutionDiagnostic, isChildModelResolutionFailure } from "../shared/model-resolution-diagnostic.ts";
@@ -1468,7 +1468,7 @@ async function runSingleAttempt(
 		result.structuredOutputSchemaPath = options.structuredOutput.schemaPath;
 		result.structuredOutputPath = options.structuredOutput.outputPath;
 		const structured = capture.structuredOutput();
-		if (!structuredOutputToolInvoked || !structured.called) {
+		if (!structured.called) {
 			result.exitCode = 1;
 			result.error = MISSING_STRUCTURED_OUTPUT_CALL_ERROR;
 			result.structuredOutputFailed = true;
@@ -1481,9 +1481,18 @@ async function runSingleAttempt(
 				? MISSING_STRUCTURED_ACCEPTANCE_REPORT_ERROR
 				: undefined;
 			(result as SingleResult & { structuredAcceptanceReport?: unknown; structuredAcceptanceReportError?: string }).structuredAcceptanceReport = acceptanceMode ? structured.acceptanceReport : undefined;
-			(result as SingleResult & { structuredAcceptanceReport?: unknown; structuredAcceptanceReportError?: string }).structuredAcceptanceReportError = acceptanceReportError;
-			writeStructuredOutputArtifacts(options.structuredOutput, structured.value, acceptanceMode ? structured.acceptanceReport : undefined);
-			validatedStructuredOutput = true;
+			const structuredValidation = await validateStructuredOutputValue(options.structuredOutput.schema, structured.value);
+			if (structuredValidation.status === "invalid") {
+				result.exitCode = 1;
+				result.error = "Structured output validation failed: " + structuredValidation.message;
+				result.structuredOutputFailed = true;
+			} else {
+				result.structuredOutput = structured.value;
+				(result as SingleResult & { structuredAcceptanceReport?: unknown; structuredAcceptanceReportError?: string }).structuredAcceptanceReport = acceptanceMode ? structured.acceptanceReport : undefined;
+				(result as SingleResult & { structuredAcceptanceReport?: unknown; structuredAcceptanceReportError?: string }).structuredAcceptanceReportError = acceptanceReportError;
+				writeStructuredOutputArtifacts(options.structuredOutput, structured.value, acceptanceMode ? structured.acceptanceReport : undefined);
+				validatedStructuredOutput = true;
+			}
 		}
 	}
 	if (result.exitCode === 0 && !result.error) {
@@ -2099,6 +2108,7 @@ async function runSyncCompletionInner(
 		result.acceptance = buildSkippedAcceptanceLedger(effectiveAcceptance, { id: "acceptance-evaluation", message });
 	}
 	const acceptanceFailure = acceptanceFailureMessage(result.acceptance);
+	const structuredAcceptanceReportMissing = (result as SingleResult & { structuredAcceptanceReportError?: string }).structuredAcceptanceReportError === MISSING_STRUCTURED_ACCEPTANCE_REPORT_ERROR;
 	stripAcceptanceReportsFromMessages(result.messages);
 	// A passing typed gate supplies the structured output for runs that have no
 	// outputSchema of their own; preflight rejects the combination.
@@ -2106,7 +2116,7 @@ async function runSyncCompletionInner(
 	if (typedGate && result.structuredOutput === undefined && !acceptanceFailure && result.exitCode === 0) {
 		result.structuredOutput = typedGate.value;
 	}
-	if (acceptanceFailure && result.acceptance.explicit && result.exitCode === 0 && !result.interrupted && !result.timedOut && !isAgentContract(options.agentContract)) {
+	if (acceptanceFailure && result.acceptance.explicit && result.exitCode === 0 && !result.interrupted && !result.timedOut && !isAgentContract(options.agentContract) && !structuredAcceptanceReportMissing) {
 		result.exitCode = 1;
 		if (result.savedOutputPath) {
 			result.finalOutput = finalizeSingleOutput({

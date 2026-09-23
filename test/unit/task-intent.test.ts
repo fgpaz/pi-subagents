@@ -31,6 +31,16 @@ describe("classifyTaskMutationIntent", () => {
 		assert.equal(classifyTaskMutationIntent("delegate", "Review only; update the report").kind, "read-only");
 	});
 
+	it("recognizes scoped tool restrictions and structured-output-only instructions", () => {
+		for (const task of [
+			"Do not use other tools; return the structured result.",
+			"Do not reread the source; summarize the prior findings.",
+			"Only invoke structured_output to return the result.",
+		]) {
+			assert.equal(taskMayMutate(task), false, task);
+		}
+	});
+
 	it("keeps advisory infinitives read-only without hiding later imperatives", () => {
 		for (const task of [
 			"Review only; explain how to update the parser.",

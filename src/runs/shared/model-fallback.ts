@@ -558,6 +558,10 @@ const RETRYABLE_MODEL_FAILURE_PATTERNS = [
 	/service unavailable/i,
 	/temporar(?:ily)? unavailable/i,
 	/connection\s+(?:error|reset|closed|aborted)/i,
+	/\bECONNREFUSED\b/i,
+	/\bECONNRESET\b/i,
+	/\bENOTFOUND\b/i,
+	/\bEAI_AGAIN\b/i,
 	/connection refused/i,
 	/fetch failed/i,
 	/network error/i,
@@ -584,7 +588,7 @@ const RETRYABLE_MODEL_FAILURE_PATTERNS = [
  * different model cannot fix them and would rerun the whole task. Tool names
  * include namespaced forms like `mcp.server/write`.
  */
-const TOOL_FAILURE_PREFIX = /^[\w.:@/-]+ failed (?:(?:\(exit \d+\):)|(?:with exit code \d+))(?:\s|$)/i;
+const TOOL_FAILURE_PREFIX = /^[\w.:@/-]+ failed (?:(?:\(exit \d+\):)|(?:with exit code \d+:)|(?:with exit code \d+)(?=\s|$))\s*/i;
 
 export function isRetryableModelFailure(error: string | undefined): boolean {
 	if (!error) return false;

@@ -76,6 +76,7 @@ import { inheritedChildRuntime } from "../shared/child-launch.ts";
 import { resultFilePath } from "./result-files.ts";
 import { updateActiveRunIndex } from "./active-run-index.ts";
 import { validateToolBudgetConfig } from "../shared/tool-budget.ts";
+import { agentLooksMutationCapable } from "../shared/writer-budget-policy.ts";
 import { usageBudgetState } from "../shared/usage-budget.ts";
 import type { ImportedAsyncRoot } from "./chain-root-attachment.ts";
 import type { SessionLeaseRequest } from "../shared/session-lease.ts";
@@ -1019,7 +1020,7 @@ export function buildAsyncRunnerSteps(id: string, params: AsyncRunnerStepBuildPa
 			if (s.model !== undefined) unsupported.push("model override");
 			if (effectiveBehavior.outputSchema !== undefined) unsupported.push("structured output");
 			if (s.acceptance !== undefined || params.agentContract !== undefined || s.agentContract !== undefined) unsupported.push("acceptance/agent contract");
-			if (s.toolBudget !== undefined || params.toolBudget !== undefined || a.toolBudget !== undefined || params.configToolBudget !== undefined) unsupported.push("tool budget");
+			if (!agentLooksMutationCapable({ agentName: a.name, acceptanceRole: a.acceptanceRole, tools: a.tools, task: s.task }) && (s.toolBudget !== undefined || params.toolBudget !== undefined || a.toolBudget !== undefined || params.configToolBudget !== undefined)) unsupported.push("tool budget");
 			if ((s.fast ?? params.fast ?? a.fast) === true) unsupported.push("fast mode");
 			if (params.contextForAgent?.(s.agent) === "fork") unsupported.push("fork context");
 			if (unsupported.length > 0) throw new AsyncStartValidationError(`Agent '${a.name}' uses runner.type='${externalRunnerType}' and does not support: ${unsupported.join(", ")}.`);
@@ -1029,7 +1030,8 @@ export function buildAsyncRunnerSteps(id: string, params: AsyncRunnerStepBuildPa
 		} catch (error) {
 			throw new AsyncStartValidationError(error instanceof Error ? error.message : String(error));
 		}
-		const toolBudgetInput = s.toolBudget ?? params.toolBudget ?? a.toolBudget ?? params.configToolBudget;
+		const skipHardBudgets = agentLooksMutationCapable({ agentName: a.name, acceptanceRole: a.acceptanceRole, tools: a.tools, task: s.task });
+		const toolBudgetInput = skipHardBudgets ? undefined : s.toolBudget ?? params.toolBudget ?? a.toolBudget ?? params.configToolBudget;
 		const resolvedToolBudget = validateToolBudgetConfig(toolBudgetInput, s.toolBudget ? "toolBudget" : a.toolBudget ? "agent.toolBudget" : "config.toolBudget");
 		if (resolvedToolBudget.error) throw new AsyncStartValidationError(resolvedToolBudget.error);
 		const resolvedToolTimeout = resolveToolTimeoutMs({
@@ -1776,7 +1778,7 @@ export function executeAsyncSingle(
 		if (params.thinkingOverride !== undefined) unsupported.push("thinking override");
 		if (params.structuredOutputSchema !== undefined) unsupported.push("structured output");
 		if (params.acceptance !== undefined || params.agentContract !== undefined) unsupported.push("acceptance/agent contract");
-		if (params.toolBudget !== undefined || agentConfig.toolBudget !== undefined || params.configToolBudget !== undefined) unsupported.push("tool budget");
+		if (!agentLooksMutationCapable({ agentName: agentConfig.name, acceptanceRole: agentConfig.acceptanceRole, tools: agentConfig.tools, task }) && (params.toolBudget !== undefined || agentConfig.toolBudget !== undefined || params.configToolBudget !== undefined)) unsupported.push("tool budget");
 		if (params.context === "fork") unsupported.push("fork context");
 		if ((params.skills?.length ?? 0) > 0) unsupported.push("skills");
 		if (permissionRules) unsupported.push("native Pi child permissions");
@@ -1909,7 +1911,8 @@ export function executeAsyncSingle(
 			return formatAsyncStartError("single", error instanceof Error ? error.message : String(error));
 		}
 	}
-	const toolBudgetInput = params.toolBudget ?? agentConfig.toolBudget ?? params.configToolBudget;
+	const skipHardBudgets = agentLooksMutationCapable({ agentName: agentConfig.name, acceptanceRole: agentConfig.acceptanceRole, tools: agentConfig.tools, task });
+	const toolBudgetInput = skipHardBudgets ? undefined : params.toolBudget ?? agentConfig.toolBudget ?? params.configToolBudget;
 	const resolvedToolBudget = validateToolBudgetConfig(toolBudgetInput, params.toolBudget ? "toolBudget" : agentConfig.toolBudget ? "agent.toolBudget" : "config.toolBudget");
 	if (resolvedToolBudget.error) return formatAsyncStartError("single", resolvedToolBudget.error);
 	const deadlineAt = params.absoluteDeadlineAt ?? (params.timeoutMs !== undefined ? Date.now() + params.timeoutMs : undefined);

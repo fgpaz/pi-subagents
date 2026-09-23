@@ -19,6 +19,7 @@ import {
 	resolveExpectedWorktreeAgentCwd,
 	resolveWorktreeProvider,
 	sanitizeWorktreePathComponent,
+	validateWorktreePatch,
 	shouldDeferWorktreeCwd,
 	WorktreeSetupError,
 	type WorktreeSetup,
@@ -862,6 +863,29 @@ process.stdout.write(JSON.stringify({ syntheticPaths: [".base-commit"] }));
 		}
 	});
 
+	it("captures the full worktree post-image without changing its real index", async () => {
+		const repoDir = createRepo("pi-worktree-index-isolation-");
+		let setup: WorktreeSetup | undefined;
+		try {
+			setup = await createWorktrees(repoDir, `index-isolation-${process.pid}`, 1);
+			const worktree = setup.worktrees[0]!;
+			fs.writeFileSync(path.join(worktree.path, "tracked.txt"), "staged version\n", "utf-8");
+			git(worktree.path, ["add", "tracked.txt"]);
+			fs.writeFileSync(path.join(worktree.path, "tracked.txt"), "final worktree version\n", "utf-8");
+			const stagedBefore = git(worktree.path, ["diff", "--cached", "--binary", "--", "tracked.txt"]);
+			const unstagedBefore = git(worktree.path, ["diff", "--binary", "--", "tracked.txt"]);
+
+			const diffs = diffWorktrees(setup, ["worker"], path.join(repoDir, "artifacts", "index-isolation"));
+			assert.equal(diffs[0]?.error, undefined);
+			assert.match(fs.readFileSync(diffs[0]!.patchPath, "utf-8"), /final worktree version/);
+			assert.equal(git(worktree.path, ["diff", "--cached", "--binary", "--", "tracked.txt"]), stagedBefore);
+			assert.equal(git(worktree.path, ["diff", "--binary", "--", "tracked.txt"]), unstagedBefore);
+		} finally {
+			if (setup) cleanupWorktrees(setup, { kind: "setup-rollback" });
+			cleanupRepo(repoDir);
+		}
+	});
+
 	it("captures applyable patches despite external diffs and display configuration", { skip: hookScriptSkip }, async () => {
 		const repoDir = createRepo("pi-worktree-diff-external-");
 		const externalDiffPath = createHookScript(repoDir, "external-diff.mjs", `
@@ -883,7 +907,7 @@ process.stdout.write("corrupt external diff output\\n");
 			const patch = fs.readFileSync(diffs[0]!.patchPath, "utf-8");
 			assert.match(patch, /^diff --git a\/tracked\.txt b\/tracked\.txt/m);
 			assert.doesNotMatch(patch, /corrupt external diff output|corrupt display prefix|\u001b/);
-			assert.equal(git(worktree.path, ["apply", "--check", "--cached", "--reverse", diffs[0]!.patchPath]), "");
+			assert.equal(validateWorktreePatch(worktree.path, diffs[0]!.patchPath), undefined);
 		} finally {
 			if (setup) cleanupWorktrees(setup, { kind: "setup-rollback" });
 			cleanupRepo(repoDir);
@@ -902,7 +926,7 @@ process.stdout.write("corrupt external diff output\\n");
 			assert.equal(diffs[0]?.error, undefined);
 			const patch = fs.readFileSync(diffs[0]!.patchPath, "utf-8");
 			assert.match(patch, /GIT binary patch/);
-			assert.equal(git(worktree.path, ["apply", "--check", "--cached", "--reverse", diffs[0]!.patchPath]), "");
+			assert.equal(validateWorktreePatch(worktree.path, diffs[0]!.patchPath), undefined);
 		} finally {
 			if (setup) cleanupWorktrees(setup, { kind: "setup-rollback" });
 			cleanupRepo(repoDir);

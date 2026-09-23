@@ -484,43 +484,28 @@ export function formatEmptyTerminalAssistantResponseError(messages: Message[]): 
  * Detect errors in subagent execution from messages (only errors with no subsequent success)
  */
 export function detectSubagentError(messages: Message[]): ErrorInfo {
-	let lastAssistantTextIndex = -1;
-	for (let i = messages.length - 1; i >= 0; i--) {
-		const msg = messages[i];
-		if (msg?.role === "assistant") {
-			const hasText = Array.isArray(msg.content) && msg.content.some(
-				(c) => c.type === "text" && "text" in c && typeof c.text === "string" && c.text.trim().length > 0,
-			);
-			if (hasText) {
-				lastAssistantTextIndex = i;
-				break;
-			}
+	let pending: ErrorInfo | undefined;
+	for (const msg of messages) {
+		if (!msg) continue;
+		if (msg.role === "assistant" && msg.stopReason === "error") {
+			const details = typeof msg.errorMessage === "string" ? msg.errorMessage : undefined;
+			pending = { hasError: true, exitCode: 1, errorType: "provider", details: details?.slice(0, 200) };
+			continue;
+		}
+		if (msg.role !== "toolResult") continue;
+		const toolName = "toolName" in msg && typeof msg.toolName === "string" ? msg.toolName : undefined;
+		if (msg.isError === true) {
+			const text = msg.content.find((c) => c.type === "text");
+			const details = text && "text" in text ? text.text : undefined;
+			const exitMatch = details?.match(/exit(?:ed)?\s*(?:with\s*)?(?:code|status)?\s*[:\s]?\s*(\d+)/i);
+			pending = { hasError: true, exitCode: exitMatch?.[1] ? parseInt(exitMatch[1], 10) : 1, errorType: toolName || "tool", details: details?.slice(0, 200) };
+		} else if (pending && pending.errorType !== "provider") {
+			// A later successful tool call proves a tool error was recovered, but it
+			// cannot wash out an independently terminal provider failure.
+			pending = undefined;
 		}
 	}
-
-	const scanStart = lastAssistantTextIndex >= 0 ? lastAssistantTextIndex + 1 : 0;
-
-	for (let i = messages.length - 1; i >= scanStart; i--) {
-		const msg = messages[i];
-		if (!msg || msg.role !== "toolResult") continue;
-		const toolName = "toolName" in msg && typeof msg.toolName === "string" ? msg.toolName : undefined;
-		const isError = "isError" in msg && msg.isError === true;
-
-		if (!isError) continue;
-
-		const text = msg.content.find((c) => c.type === "text");
-		const details = text && "text" in text ? text.text : undefined;
-		const exitMatch = details?.match(/exit(?:ed)?\s*(?:with\s*)?(?:code|status)?\s*[:\s]?\s*(\d+)/i);
-		const exitCodeText = exitMatch?.[1];
-		return {
-			hasError: true,
-			exitCode: exitCodeText ? parseInt(exitCodeText, 10) : 1,
-			errorType: toolName || "tool",
-			details: details?.slice(0, 200),
-		};
-	}
-
-	return { hasError: false };
+	return pending ?? { hasError: false };
 }
 
 /**
