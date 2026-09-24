@@ -466,6 +466,21 @@ function readRunnerStartup(startupPath: string, expectedState: RunnerStartupStat
 	}
 }
 
+function describeReadyStartupTimeout(startupPath: string, expectedState: RunnerStartupState, timeoutMs: number, processStillOpen: boolean): string {
+	// Partial diagnostics only: do not change the handshake, lease, or timeout.
+	const asyncDir = path.dirname(startupPath);
+	const startupPresent = fs.existsSync(startupPath);
+	const logs = ["stdout", "stderr"].map((stream) => {
+		const logPath = path.join(asyncDir, `runner.${stream}.log`);
+		try {
+			return `${stream}=${fs.statSync(logPath).size}B`;
+		} catch {
+			return `${stream}=missing`;
+		}
+	}).join(", ");
+	return `Timed out after ${timeoutMs}ms waiting for the async runner startup state '${expectedState}' (startup file ${startupPresent ? "present but not in expected state" : "absent"}, process ${processStillOpen ? "still open" : "closed"}, logs ${logs}).`;
+}
+
 async function waitForRunnerStartup(startupPath: string, expectedState: RunnerStartupState, timeoutMs: number, expectedToken?: string, processClosed?: Promise<{ exitCode: number | null; signal: NodeJS.Signals | null }>): Promise<RunnerStartupWaitResult> {
 	const confirmOpen = async (result: RunnerStartupWaitResult): Promise<RunnerStartupWaitResult> => {
 		if (!processClosed || result.ok === false) return result;
@@ -495,7 +510,10 @@ async function waitForRunnerStartup(startupPath: string, expectedState: RunnerSt
 	}
 	const finalResult = readRunnerStartup(startupPath, expectedState, expectedToken);
 	if (finalResult) return finalResult;
-	return { ok: false, error: `Timed out after ${timeoutMs}ms waiting for the async runner startup state '${expectedState}'.`, startupDidNotProceed: true };
+	const closedAtTimeout = processClosed
+		? await Promise.race([processClosed.then(() => true), new Promise<false>((resolve) => setImmediate(() => resolve(false)))])
+		: false;
+	return { ok: false, error: describeReadyStartupTimeout(startupPath, expectedState, timeoutMs, !closedAtTimeout), startupDidNotProceed: true };
 }
 
 const writePrivateStartupControlJson = createAtomicJsonWriter({ mode: 0o600, ignoreCleanupErrorAfterSuccess: true });

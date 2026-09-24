@@ -55,6 +55,7 @@ describe("workflow host commands", () => {
 		assert.match(result.stdout, /passed/);
 		assert.match(result.stderr, /warning/);
 		assert.equal(result.outputPath, outputPath);
+		assert.equal(result.outputTruncated, false);
 		assert.match(fs.readFileSync(outputPath, "utf8"), /passed/);
 		if (process.platform !== "win32") assert.equal(fs.statSync(outputPath).mode & 0o777, 0o600);
 		assert.deepEqual(fs.readdirSync(path.dirname(outputPath)), ["command.log"]);
@@ -76,13 +77,31 @@ describe("workflow host commands", () => {
 
 		const timedOut = await executeWorkflowHostCommand({
 			key: "timeout",
-			params: { kind: "command", command: commandFor(root, `setTimeout(() => {}, 10000);`), timeoutMs: 20 },
+			params: { kind: "command", command: commandFor(root, `process.stdout.write("partial output\\n"); setTimeout(() => {}, 10000);`), timeoutMs: 100 },
 			cwd: root,
 			defaultOutputPath: path.join(root, "timeout.log"),
 			signal: new AbortController().signal,
 		});
 		assert.equal(timedOut.state, "timed-out");
 		assert.match(timedOut.error ?? "", /timed out/);
+		assert.equal(timedOut.outputTruncated, false);
+		assert.match(fs.readFileSync(timedOut.outputPath, "utf8"), /partial output/);
+	});
+
+	it("reports when saved command output was truncated at the capture limit", async () => {
+		const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-host-command-truncated-"));
+		roots.push(root);
+		const result = await executeWorkflowHostCommand({
+			key: "large-output",
+			params: { kind: "command", command: commandFor(root, `process.stdout.write(Buffer.alloc(1024 * 1024 + 32, 120));`), timeoutMs: 5000 },
+			cwd: root,
+			defaultOutputPath: path.join(root, "large.log"),
+			signal: new AbortController().signal,
+		});
+		assert.equal(result.state, "passed");
+		assert.equal(result.outputTruncated, true);
+		assert.equal(fs.statSync(result.outputPath).size, 1024 * 1024);
+
 	});
 
 	it("rejects symlinked output parents before creating outside directories", { skip: process.platform === "win32" ? "symlink permissions vary on Windows" : undefined }, async () => {

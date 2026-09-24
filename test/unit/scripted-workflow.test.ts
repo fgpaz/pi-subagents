@@ -247,7 +247,7 @@ describe("scripted workflow runtime", () => {
 				script: `const params = { kind: "command", command: "npm test", timeoutMs: 1000, cwd: "/tmp" }; return await runs.host("tests", params);`,
 				async host() {
 					called = true;
-					return { key: "tests", kind: "command", ok: true, state: "passed", exitCode: 0, stdout: "", stderr: "", outputPath: "tests.log", durationMs: 1 };
+					return { key: "tests", kind: "command", ok: true, state: "passed", exitCode: 0, stdout: "", stderr: "", outputPath: "tests.log", outputTruncated: false, durationMs: 1 };
 				},
 				async launch(key) { return { key, ok: true, output: "unused", artifactPaths: [] }; },
 				async status(key) { return { key, ok: true, output: "unused", artifactPaths: [] }; },
@@ -264,7 +264,7 @@ describe("scripted workflow runtime", () => {
 			script: `return await runs.host("tests", { kind: "command", command: "npm test", timeoutMs: 1000, role: "ci", provider: "local" });`,
 			async host(key, params) {
 				assert.equal(params.kind, "command");
-				return { key, kind: "command", ok: true, state: "passed", exitCode: 0, stdout: "ok", stderr: "", outputPath: "tests.log", durationMs: 2 };
+				return { key, kind: "command", ok: true, state: "passed", exitCode: 0, stdout: "ok", stderr: "", outputPath: "tests.log", outputTruncated: false, durationMs: 2 };
 			},
 			onHostStep(step) { steps.push(`${step.state}:${step.role ?? ""}`); },
 			async launch(key) { return { key, ok: true, output: "unused", artifactPaths: [] }; },
@@ -278,7 +278,7 @@ describe("scripted workflow runtime", () => {
 	it("fails the workflow when a host command fails", async () => {
 		await assert.rejects(runWorkflowScript({
 			script: `return await runs.host("tests", { kind: "command", command: "npm test", timeoutMs: 1000 });`,
-			async host(key) { return { key, kind: "command", ok: false, state: "failed", exitCode: 2, stdout: "", stderr: "bad", outputPath: "tests.log", durationMs: 2, error: "Command exited with code 2." }; },
+			async host(key) { return { key, kind: "command", ok: false, state: "failed", exitCode: 2, stdout: "", stderr: "bad", outputPath: "tests.log", outputTruncated: false, durationMs: 2, error: "Command exited with code 2." }; },
 			async launch(key) { return { key, ok: true, output: "unused", artifactPaths: [] }; },
 			async status(key) { return { key, ok: true, output: "unused", artifactPaths: [] }; },
 		}), /Host command 'tests' failed/);
@@ -293,7 +293,7 @@ describe("scripted workflow runtime", () => {
 	it("rejects an unawaited host command", async () => {
 		await assert.rejects(runWorkflowScript({
 			script: `runs.host("tests", { kind: "command", command: "npm test", timeoutMs: 1000 }); return "done";`,
-			async host(key) { return { key, kind: "command", ok: true, state: "passed", exitCode: 0, stdout: "", stderr: "", outputPath: "tests.log", durationMs: 1 }; },
+			async host(key) { return { key, kind: "command", ok: true, state: "passed", exitCode: 0, stdout: "", stderr: "", outputPath: "tests.log", outputTruncated: false, durationMs: 1 }; },
 			async launch(key) { return { key, ok: true, output: "unused", artifactPaths: [] }; },
 			async status(key) { return { key, ok: true, output: "unused", artifactPaths: [] }; },
 		}), /unawaited runs\.host/);
@@ -303,7 +303,7 @@ describe("scripted workflow runtime", () => {
 		const calls = Array.from({ length: 33 }, (_, index) => `await runs.host("host-${index}", { kind: "command", command: "true", timeoutMs: 1000 });`).join("\n");
 		await assert.rejects(runWorkflowScript({
 			script: `${calls}\nreturn "done";`,
-			async host(key) { return { key, kind: "command", ok: true, state: "passed", exitCode: 0, stdout: "", stderr: "", outputPath: `${key}.log`, durationMs: 1 }; },
+			async host(key) { return { key, kind: "command", ok: true, state: "passed", exitCode: 0, stdout: "", stderr: "", outputPath: `${key}.log`, outputTruncated: false, durationMs: 1 }; },
 			async launch(key) { return { key, ok: true, output: "unused", artifactPaths: [] }; },
 			async status(key) { return { key, ok: true, output: "unused", artifactPaths: [] }; },
 		}), /at most 32 runs\.host calls/);

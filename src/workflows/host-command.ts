@@ -31,6 +31,7 @@ export interface WorkflowHostCommandResult {
 	stdout: string;
 	stderr: string;
 	outputPath: string;
+	outputTruncated: boolean;
 	durationMs: number;
 	error?: string;
 }
@@ -167,6 +168,8 @@ export async function executeWorkflowHostCommand(input: {
 	let stdout = "";
 	let stderr = "";
 	let capture = "";
+	let captureBytes = 0;
+	let outputTruncated = false;
 	let timedOut = false;
 	let stopped = false;
 	let settled = false;
@@ -197,13 +200,18 @@ export async function executeWorkflowHostCommand(input: {
 		const onAbort = () => terminate("abort");
 		if (input.signal.aborted) onAbort();
 		else input.signal.addEventListener("abort", onAbort, { once: true });
+		const captureChunk = (chunk: Buffer) => {
+			if (captureBytes + chunk.byteLength > MAX_CAPTURE_BYTES) outputTruncated = true;
+			captureBytes += chunk.byteLength;
+			capture = appendBounded(capture, chunk, MAX_CAPTURE_BYTES);
+		};
 		child.stdout.on("data", (chunk: Buffer) => {
 			stdout = appendBounded(stdout, chunk, MAX_PREVIEW_BYTES);
-			capture = appendBounded(capture, chunk, MAX_CAPTURE_BYTES);
+			captureChunk(chunk);
 		});
 		child.stderr.on("data", (chunk: Buffer) => {
 			stderr = appendBounded(stderr, chunk, MAX_PREVIEW_BYTES);
-			capture = appendBounded(capture, chunk, MAX_CAPTURE_BYTES);
+			captureChunk(chunk);
 		});
 		const finish = async (exitCode: number | null, spawnError?: unknown) => {
 			if (settled) return;
@@ -227,7 +235,7 @@ export async function executeWorkflowHostCommand(input: {
 				reject(new Error(`runs.host('${input.key}') could not save command output: ${writeError instanceof Error ? writeError.message : String(writeError)}`, { cause: writeError instanceof Error ? writeError : undefined }));
 				return;
 			}
-			resolve({ key: input.key, kind: "command", ok: state === "passed", state, exitCode, stdout, stderr, outputPath, durationMs: Date.now() - startedAt, ...(error ? { error } : {}) });
+			resolve({ key: input.key, kind: "command", ok: state === "passed", state, exitCode, stdout, stderr, outputPath, outputTruncated, durationMs: Date.now() - startedAt, ...(error ? { error } : {}) });
 		};
 		child.on("close", (code) => { void finish(code); });
 		child.on("error", (error) => { void finish(null, error); });

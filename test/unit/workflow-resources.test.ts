@@ -153,7 +153,7 @@ describe("named workflow resources", () => {
 			async host(key, params) {
 				assert.equal(key, "ci");
 				assert.equal(params.command, "npm test");
-				return { key, kind: "command", ok: true, state: "passed", exitCode: 0, stdout: "ok", stderr: "", outputPath: "ci.log", durationMs: 1 };
+				return { key, kind: "command", ok: true, state: "passed", exitCode: 0, stdout: "ok", stderr: "", outputPath: "ci.log", outputTruncated: false, durationMs: 1 };
 			},
 			async launch(key) { return { key, ok: true, output: "unused", artifactPaths: [] }; },
 			async status(key) { return { key, ok: true, output: "unused", artifactPaths: [] }; },
