@@ -5,3 +5,6 @@ AGENTS.md
 node_modules/
 .fallow/
 tmp/
+
+# harness local, no se sube
+.grok/workflows/
