@@ -1046,6 +1046,8 @@ export interface AcceptanceConfig {
 	report?: "on" | "off";
 	/** Preserve an intentional launch-time staged index, while rejecting any terminal index change. */
 	preserveStagedIndex?: true;
+	/** Defer absent C2 evidence to the parent FINAL_VERIFY; reported failures remain rejecting. */
+	deferC2?: true;
 	criteria?: Array<string | AcceptanceGate>;
 	evidence?: AcceptanceEvidenceKind[];
 	verify?: AcceptanceVerifyCommand[];
@@ -1071,6 +1073,8 @@ export interface ResolvedAcceptanceConfig {
 	criteria: ResolvedAcceptanceGate[];
 	evidence: AcceptanceEvidenceKind[];
 	preserveStagedIndex?: true;
+	/** C2 evidence may be deferred to the parent when explicitly configured by the parent. */
+	deferC2UntilParentFinalVerify?: true;
 	verify: AcceptanceVerifyCommand[];
 	review?: AcceptanceReviewGate | false;
 	stopRules: string[];

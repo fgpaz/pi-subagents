@@ -851,6 +851,68 @@ describe("acceptance gates", () => {
 			});
 			assert.equal(emptyCommands.status, "rejected");
 			assert.match(acceptanceFailureMessage(emptyCommands) ?? "", /commands-run evidence missing/);
+
+			const noC2Task = [
+				"Implement only during BUILD.",
+				"NO TESTS OR VALIDATION DURING BUILD",
+				"Only the goal-root parent owns FINAL_VERIFY.",
+			].join("\n");
+			const noC2Acceptance = resolveEffectiveAcceptance({
+				agentName: "worker",
+				task: noC2Task,
+				explicit: { level: "checked", deferC2: true, evidence: ["changed-files", "tests-added", "commands-run", "validation-output"] },
+			});
+			const deferred = await evaluateAcceptance({
+				acceptance: noC2Acceptance,
+				output: report({
+					changedFiles: ["src/file.ts"],
+					testsAddedOrUpdated: ["test/file.test.ts"],
+					commandsRun: [],
+					validationOutput: [],
+				}),
+				cwd,
+			});
+			assert.equal(noC2Acceptance.deferC2UntilParentFinalVerify, true);
+			assert.equal(deferred.status, "checked");
+			assert.equal(deferred.runtimeChecks.find((check) => check.id === "evidence:commands-run")?.status, "not-applicable");
+			assert.match(deferred.runtimeChecks.find((check) => check.id === "evidence:commands-run")?.message ?? "", /deferred to parent FINAL_VERIFY/);
+			assert.equal(deferred.runtimeChecks.find((check) => check.id === "evidence:validation-output")?.status, "not-applicable");
+			assert.equal(deferred.runtimeChecks.find((check) => check.id === "evidence:changed-files")?.status, "passed");
+			assert.equal(deferred.runtimeChecks.find((check) => check.id === "evidence:tests-added")?.status, "passed");
+
+			const missingFiles = await evaluateAcceptance({
+				acceptance: noC2Acceptance,
+				output: report({ changedFiles: undefined, testsAddedOrUpdated: ["test/file.test.ts"], commandsRun: [], validationOutput: [] }),
+				cwd,
+			});
+			assert.equal(missingFiles.status, "rejected", "no-C2 must not waive changed-files evidence");
+			assert.match(acceptanceFailureMessage(missingFiles) ?? "", /changed-files evidence missing/);
+
+			const failedCommand = await evaluateAcceptance({
+				acceptance: noC2Acceptance,
+				output: report({ commandsRun: [{ command: "npm test", result: "failed", summary: "test failed" }], validationOutput: [] }),
+				cwd,
+			});
+			assert.equal(failedCommand.status, "rejected", "typed C2 deferral must not waive a reported failed command");
+			assert.match(acceptanceFailureMessage(failedCommand) ?? "", /reports a failed command/);
+
+			const taskMarkerOnly = resolveEffectiveAcceptance({
+				agentName: "worker",
+				task: noC2Task,
+				explicit: { level: "checked", evidence: ["commands-run"] },
+			});
+			const taskMarkerMissing = await evaluateAcceptance({ acceptance: taskMarkerOnly, output: report({ commandsRun: [] }), cwd });
+			assert.equal(taskMarkerOnly.deferC2UntilParentFinalVerify, undefined);
+			assert.equal(taskMarkerMissing.status, "rejected", "task-text marker alone must not disable evidence checks");
+
+			const ambiguousTaskAcceptance = resolveEffectiveAcceptance({
+				agentName: "worker",
+				task: "Please avoid running tests for now, then return your report.",
+				explicit: { level: "checked", evidence: ["commands-run"] },
+			});
+			const ambiguousMissing = await evaluateAcceptance({ acceptance: ambiguousTaskAcceptance, output: report({ commandsRun: [] }), cwd });
+			assert.equal(ambiguousTaskAcceptance.deferC2UntilParentFinalVerify, undefined);
+			assert.equal(ambiguousMissing.status, "rejected", "ambiguous task prose must not disable evidence checks");
 		} finally {
 			fs.rmSync(cwd, { recursive: true, force: true });
 		}

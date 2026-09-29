@@ -52,7 +52,7 @@ const VALID_EVIDENCE_KINDS: AcceptanceEvidenceKind[] = [
 const VALID_EVIDENCE = new Set<AcceptanceEvidenceKind>(VALID_EVIDENCE_KINDS);
 const ACCEPTANCE_EVIDENCE_HELP = `Supported evidence kinds: ${VALID_EVIDENCE_KINDS.join(", ")}. Example: { level: "checked", evidence: ["commands-run", "changed-files"] }.`;
 const ACCEPTANCE_OBJECT_EXAMPLE = "Example: { level: \"checked\", evidence: [\"commands-run\", \"changed-files\"] }.";
-const ACCEPTANCE_CONFIG_KEYS = new Set(["level", "report", "preserveStagedIndex", "criteria", "evidence", "verify", "review", "stopRules", "reason"]);
+const ACCEPTANCE_CONFIG_KEYS = new Set(["level", "report", "preserveStagedIndex", "deferC2", "criteria", "evidence", "verify", "review", "stopRules", "reason"]);
 const ACCEPTANCE_GATE_KEYS = new Set(["id", "must", "evidence", "severity"]);
 const ACCEPTANCE_VERIFY_KEYS = new Set(["id", "command", "timeoutMs", "cwd", "env", "allowFailure", "output", "schema"]);
 const ACCEPTANCE_REVIEW_KEYS = new Set(["agent", "focus", "required"]);
@@ -65,6 +65,8 @@ function normalizeLevel(level: AcceptanceLevel | undefined): Exclude<AcceptanceL
 function unique<T>(items: T[]): T[] {
 	return [...new Set(items)];
 }
+
+const C2_EVIDENCE_KINDS = new Set<AcceptanceEvidenceKind>(["commands-run", "validation-output"]);
 
 function requiredEvidenceForLevel(level: Exclude<AcceptanceLevel, "auto">): AcceptanceEvidenceKind[] {
 	switch (level) {
@@ -316,6 +318,9 @@ export function validateAcceptanceInput(input: unknown, pathLabel = "acceptance"
 	if (value.preserveStagedIndex !== undefined && value.preserveStagedIndex !== true) {
 		errors.push(`${pathLabel}.preserveStagedIndex must be true when provided.`);
 	}
+	if (value.deferC2 !== undefined && value.deferC2 !== true) {
+		errors.push(`${pathLabel}.deferC2 must be true when provided.`);
+	}
 	if (value.preserveStagedIndex === true && value.level !== "checked" && value.level !== "verified") {
 		errors.push(`${pathLabel}.preserveStagedIndex requires level checked or verified.`);
 	}
@@ -513,6 +518,7 @@ export function resolveEffectiveAcceptance(input: {
 }): ResolvedAcceptanceConfig {
 	const explicit = normalizeAcceptanceInput(input.explicit);
 	const explicitLevel = normalizeLevel(explicit.level);
+	const deferC2UntilParentFinalVerify = explicit.deferC2 === true ? true as const : undefined;
 	if (isAgentContract(input.agentContract)) {
 		const level = explicitAcceptanceCanDisable(explicit) || explicitLevel === "auto"
 			? "none"
@@ -529,6 +535,7 @@ export function resolveEffectiveAcceptance(input: {
 			criteria,
 			evidence,
 			preserveStagedIndex: explicit.preserveStagedIndex,
+			...(deferC2UntilParentFinalVerify ? { deferC2UntilParentFinalVerify } : {}),
 			verify: explicit.verify ?? [],
 			review: explicit.review,
 			stopRules: explicit.stopRules ?? [],
@@ -555,6 +562,7 @@ export function resolveEffectiveAcceptance(input: {
 		criteria: level === "none" ? [] : criteria,
 		evidence: level === "none" ? [] : evidence,
 		preserveStagedIndex: explicit.preserveStagedIndex,
+		...(deferC2UntilParentFinalVerify ? { deferC2UntilParentFinalVerify } : {}),
 		verify: explicit.verify ?? [],
 		review,
 		stopRules: explicit.stopRules ?? [],
@@ -584,7 +592,8 @@ export function formatAcceptancePrompt(acceptance: ResolvedAcceptanceConfig, opt
 		"Criteria:",
 		...(acceptance.criteria.length ? acceptance.criteria.map((criterion) => `- ${criterion.id}: ${criterion.must}`) : ["- Return the requested result."]),
 		"",
-		`Required evidence: ${acceptance.evidence.join(", ") || "none"}`,
+		`Required evidence: ${acceptance.evidence.map((kind) => acceptance.deferC2UntilParentFinalVerify && C2_EVIDENCE_KINDS.has(kind) ? `${kind} (deferred to parent FINAL_VERIFY)` : kind).join(", ") || "none"}`,
+		...(acceptance.deferC2UntilParentFinalVerify ? ["C2 is deferred to the parent FINAL_VERIFY only when no C2 command/output is available: use empty commandsRun and validationOutput arrays only when actually empty. Report any C2 evidence truthfully, including failures; do not run or invent C2 evidence."] : []),
 	];
 	if (acceptance.preserveStagedIndex) {
 		lines.push("The host will verify that the staged index is unchanged from launch; report noStagedFiles truthfully even when the preserved index is non-empty.");
@@ -617,8 +626,8 @@ export function formatAcceptancePrompt(acceptance: ResolvedAcceptanceConfig, opt
 				.map((criterion) => ({ id: criterion.id, status: "satisfied", evidence: "specific proof" })),
 			changedFiles: ["src/file.ts"],
 			testsAddedOrUpdated: ["test/file.test.ts"],
-			commandsRun: [{ command: "command", result: "passed", summary: "short result" }],
-			validationOutput: ["validation output or concise summary"],
+			commandsRun: acceptance.deferC2UntilParentFinalVerify ? [] : [{ command: "command", result: "passed", summary: "short result" }],
+			validationOutput: acceptance.deferC2UntilParentFinalVerify ? [] : ["validation output or concise summary"],
 			residualRisks: ["none"],
 			noStagedFiles: true,
 			diffSummary: "short description of the diff",
@@ -1166,6 +1175,15 @@ function checkStagedIndexUnchanged(cwd: string, baseline: string): AcceptanceRun
 function runStructuralChecks(acceptance: ResolvedAcceptanceConfig, report: AcceptanceReport, cwd: string): AcceptanceRuntimeCheck[] {
 	const checks: AcceptanceRuntimeCheck[] = [];
 	for (const kind of acceptance.evidence) {
+		if (acceptance.deferC2UntilParentFinalVerify && C2_EVIDENCE_KINDS.has(kind)) {
+			const hasEvidence = kind === "commands-run"
+				? Array.isArray(report.commandsRun) && report.commandsRun.length > 0
+				: isStringArray(report.validationOutput) && report.validationOutput.length > 0;
+			if (!hasEvidence) {
+				checks.push({ id: `evidence:${kind}`, status: "not-applicable", message: `${kind} deferred to parent FINAL_VERIFY because this report has no C2 evidence.` });
+				continue;
+			}
+		}
 		if (kind === "no-staged-files" && acceptance.preserveStagedIndex) continue;
 		if (kind === "no-staged-files" && report.noStagedFiles === undefined) continue;
 		const status = reportEvidenceStatus(report, kind);
@@ -1178,6 +1196,11 @@ function runStructuralChecks(acceptance: ResolvedAcceptanceConfig, report: Accep
 					? `${kind} evidence explicitly reported as not applicable.`
 					: `${kind} evidence missing from child report.`,
 		});
+	}
+	for (const [index, command] of (report.commandsRun ?? []).entries()) {
+		if (command.result === "failed") {
+			checks.push({ id: `commands-run:${index}`, status: "failed", message: `commandsRun[${index}] reports a failed command: ${command.command}` });
+		}
 	}
 	if (!acceptance.preserveStagedIndex && acceptance.evidence.includes("no-staged-files")) checks.push(checkNoStagedFiles(cwd));
 	return checks;
