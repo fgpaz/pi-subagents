@@ -1,0 +1,93 @@
+required:
+  - repo.name
+  - language.policy_lang
+  - language.docs_lang
+  - tracker.provider
+  - secrets
+  - wrappers
+  - wiki.workspace_alias
+  - qa
+  - subagents
+last_updated: "2026-10-02"
+schema: "ae-repo-policy/v1"
+version: 1
+kernel_min_version: "908b4f44"
+
+authority:
+  schema: "ae-authority/v1"
+  version: 1
+  model:
+    - "Kernel"
+    - "Team"
+    - "Repository"
+    - "Person"
+    - "Session"
+  kernel:
+    id: "ae-kernel"
+  team:
+    id: "local-team"
+  repository:
+    id: "pi-subagents"
+  person:
+    id: "local-person"
+  session:
+    id: "local-session"
+  allowlist:
+    version: "v1"
+    paths:
+      - "CLAUDE.md"
+      - "AGENTS.md"
+      - ".docs/ae/repo-policy.yaml"
+      - ".docs/raw/repo-policy.yaml"
+
+repo:
+  name: "pi-subagents"
+  description: "Pi subagent orchestration library forked from its public upstream."
+  structure_rules:
+    - "AGENTS.md is generated policy; retain its upstream requirement to read VISION.md before product, architecture, scope, or backlog decisions."
+    - "VISION.md is the acceptance policy; preserve the upstream project boundaries and evidence requirements."
+    - "This repository owns Pi delegation, child launch contracts, workflow orchestration, supervision, observability, and result handoff; it is not a general project manager or tracker."
+    - "Keep upstream product/runtime behavior and dependency declarations unchanged in this AE setup."
+    - "No GitHub Actions workflows; validation and automation must not introduce GitHub Actions."
+    - "Use a single writer for repository mutations; avoid compaction as a workflow or coordination mechanism."
+    - "Do not commit secrets, tokens, OAuth material, .env files, or raw customer data."
+language:
+  policy_lang: "English"
+  docs_lang: "Spanish"
+  ux_orthography_rules: []
+tracker:
+  provider: "Linear"
+  linear:
+    base_url: "https://api.linear.app/graphql"
+    key_env: "LINEAR_API_KEY"
+    workspace: "Teslita Agents"
+    projects:
+      - key: "MIPI"
+        name: "mi-pi"
+        scope: "harness, workers, governance, runtime"
+secrets:
+  vault: "teslita"
+  tool: "mi-key-cli"
+wrappers:
+  - name: "secret-management"
+    script: "mi-key-cli"
+    precondition: "Resolve credentials through the configured vault; never store secret values in repository files."
+    authority: "repository policy"
+wiki:
+  paths_file: "README.md"
+  workspace_alias: "pi-subagents"
+  layers_map:
+    "00": "Governance and repository boundaries"
+    "02": "Project documentation and operator context"
+    "03": "Architecture and upstream design"
+    "04": "Technical behavior and flows"
+    "10": "Technical contracts"
+    "context": "Upstream vision and project documentation"
+qa:
+  canon_paths:
+    - "README.md"
+subagents:
+  roster_file: "agents/README.md"
+extras:
+  - "The repository is a fork of an upstream public library; preserve upstream scope, compatibility, and ownership boundaries."
+  - "No new product promises or RS/RF/TP artifacts are introduced by AE setup."
