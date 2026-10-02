@@ -1,4 +1,4 @@
-# AGENTS.md — pi-subagents Agentic Engineering Policy
+# CLAUDE.md — pi-subagents Agentic Engineering Policy
 
 > **Authority**: Project documentation and operator context + AE-KERNEL-V2.md. **Language**: English. L0 operating policy for pi-subagents.
 
@@ -25,7 +25,7 @@ The principal session is **Chief of Staff**, not a leaf implementer.
 - **Non-trivial / multi-file / multi-axis**: launch leaves; do not expand the principal into full implementation.
 - Leaf dispatch is ROI-positive: spawn when separable ownership and expected value beat orchestration cost. Adapter availability alone never forces a worker.
 - If spawn is blocked: announce owner_surface + rule + how_to_unblock. Silent multi-axis parent-implement is forbidden.
-- `$writing-plans` is for orchestrator→leaf task packets only, not a human-facing ceremony.
+- `writing-plans` is for orchestrator→leaf task packets only, not a human-facing ceremony.
 - **Operator-facing language**: answer what the operator asked first, in their language and words; name lanes by what they do ("the lane fixing compaction"), never by pane/lane/test codes alone; orchestration detail (screens, statuses, watchers, retries) only on request. A lane — herdr, another session or an in-harness subagent — is reported as goal, stage and result.
 
 ## Context rules (ps-contexto)
@@ -111,7 +111,7 @@ Keep `AGENTS.md`, `CLAUDE.md`, and project-local skills in English. All other pr
     precondition: Resolve credentials through the configured vault; never store secret values in repository files.
     authority: repository policy
 
-**private network precondition**: before `deployment-cli` or `remote-cli`, confirm private access to the target environment (ask the user if not already confirmed).
+**private network precondition**: before remote or deployment operations, confirm private access to the target environment.
 
 
 ## Repository-Specific Contract
@@ -152,8 +152,8 @@ Pi subagent orchestration library forked from its public upstream.
 
 ---
 
-**Version**: AGENTS.md (AE-KERNEL-V2)
+**Version**: CLAUDE.md (AE-KERNEL-V2)
 **Status**: Generated from AE-POLICY-PROJECTION-V2
 **Last Updated**: 2026-10-02
-**Source**: repo-policy.yaml + template.agents
+**Source**: repo-policy.yaml + template.claude
 <!-- kernel_version: 908b4f44 -->

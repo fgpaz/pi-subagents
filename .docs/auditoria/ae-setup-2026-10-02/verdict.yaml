@@ -1,0 +1,54 @@
+sdd_session_contract: ae-setup-v1
+timestamp: "2026-10-02"
+status: PASS
+setup_verdict: PASS
+owner_review: PASS
+completion_boundary: setup_local_only
+
+results:
+  kernel:
+    status: fresh
+    version: "908b4f44"
+  capa_ae_antes: legacy
+  capa_ae_despues: kernel_v2
+  layout_classification:
+    raw_plans_prompts_preserved: true
+    raw_paths: [.docs/raw/plans/**, .docs/raw/prompts/**]
+    cleanup_or_deletion: explicit_separate_scope_only
+    ae_wiki_inspected: false
+  repo_policy:
+    status: creado
+    path: ".docs/ae/repo-policy.yaml"
+  twin_drift:
+    twin_kernel_version: missing
+    kernel_live_sha8: "908b4f44"
+    render_required: true
+  render:
+    status: twins_match
+    lineas_claude: 160
+    lineas_agents: 160
+    kernel_version: "908b4f44"
+  documentation_scope_checks:
+    delimited_deprecation_scan: 0
+    roster_reference: repaired
+    roster_reference_basis: "agents/README.md was absent; the repo-policy roster_file points to this factual index."
+    owner_review_sources: "Coordinator-reported local setup acceptance; upstream references: VISION.md, README.md, docs/, and existing agent definition files."
+    product_or_integration_verdict: not_claimed
+  local_render:
+    enabled: false
+    files: []
+  wiki:
+    status: not_applicable
+    reason: "Fork de biblioteca upstream; no se introducen promesas, RS/RF/TP ni comportamiento de producto nuevo. README.md, VISION.md y docs existentes son la autoridad de contenido técnico."
+  navigation:
+    status: partial
+    native: "mi-lsp nav find devolvió index_not_ready / explicit_incomplete; no se inicializó ni indexó el workspace."
+    fallback: "Se leyeron únicamente los briefs indicados, instrucciones AGENTS.md/VISION.md y fuentes de policy necesarias."
+  cleanup:
+    temp_borrado: false
+    auditoria_borradas: []
+    auditoria_hold: []
+    deprecated_refs: not_run
+  target_branch: "chore/ae-setup"
+  target_head: "039bb90b5d3aea70e2a70790faf1c362a631d439"
+  next_action: "pi-jefe continúa el ciclo AE para integrar a origin/main; este veredicto cubre solo setup local. No declara integración ni producto completo."
