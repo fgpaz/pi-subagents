@@ -994,6 +994,59 @@ export default function() {
 		assert.equal(payload.results[0]?.acceptance?.status, "rejected");
 	});
 
+	it("background structured output boundary forgives a prior tool error with or without an intro", { skip: !isAsyncAvailable() ? "jiti not available" : undefined }, async () => {
+		for (const [label, intro] of [["intro", "Final report:"], ["no-intro", undefined]] as const) {
+			const callId = `background-structured-${label}`;
+			mockPi.onCall({
+				stdoutRaw: [
+					{ type: "tool_result_end", message: { role: "toolResult", toolCallId: `${callId}-read`, toolName: "read", isError: true, content: [{ type: "text", text: "ENOENT: no such file or directory" }] } },
+					{
+						type: "message_end",
+						message: {
+							role: "assistant",
+							content: [
+								...(intro === undefined ? [] : [{ type: "text", text: intro }]),
+								{ type: "toolCall", id: callId, name: "structured_output", arguments: { value: { ok: true } } },
+							],
+							model: "mock/test-model",
+							stopReason: "toolUse",
+							usage: { input: 10, output: 5, cacheRead: 0, cacheWrite: 0, cost: { total: 0.001 } },
+						},
+					},
+					{ type: "tool_execution_start", toolName: "structured_output", args: { value: { ok: true } } },
+					{ type: "tool_result_end", message: { role: "toolResult", toolCallId: callId, toolName: "structured_output", isError: false, content: [{ type: "text", text: "Structured output captured." }] } },
+					{ type: "tool_execution_end", toolName: "structured_output" },
+				].map((entry) => JSON.stringify(entry)).join("\n") + "\n",
+				structuredOutputCapture: { ok: true },
+			});
+
+			const id = `${callId}-${Date.now().toString(36)}`;
+			executeAsyncSingle(id, {
+				agent: "worker",
+				task: "Return structured data",
+				agentConfig: makeAgent("worker", { completionGuard: false }),
+				ctx: { pi: { events: { emit() {} } }, cwd: tempDir, currentSessionId: "session-1" },
+				artifactConfig: {
+					enabled: false,
+					includeInput: false,
+					includeOutput: false,
+					includeJsonl: false,
+					includeMetadata: false,
+					cleanupDays: 7,
+				},
+				shareEnabled: false,
+				sessionRoot: path.join(tempDir, "sessions"),
+				maxSubagentDepth: 2,
+				acceptance: false,
+				structuredOutputSchema: { type: "object", required: ["ok"], properties: { ok: { type: "boolean" } } },
+			});
+
+			const payload = JSON.parse(fs.readFileSync(await waitForAsyncResultFile(id, 10_000), "utf-8")) as AsyncResultPayload;
+			assert.equal(payload.success, true);
+			assert.deepEqual(payload.results[0]?.structuredOutput, { ok: true });
+		}
+	});
+
 	it("background bash-enabled non-implementation agents can opt out of the completion guard", { skip: !isAsyncAvailable() ? "jiti not available" : undefined }, async () => {
 		mockPi.onCall({ output: "cold start test after patch" });
 
