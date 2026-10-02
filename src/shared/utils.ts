@@ -484,7 +484,30 @@ export function formatEmptyTerminalAssistantResponseError(messages: Message[]): 
  * Detect errors in subagent execution from messages (only errors with no subsequent success)
  */
 export function detectSubagentError(messages: Message[]): ErrorInfo {
+	// A structured_output call is terminal only when it is the sole tool call in
+	// the final assistant message. Its args/capture file are not evidence; the
+	// toolResult correlated by toolCallId is the only successful transport boundary.
+	let terminalStructuredOutputCallId: string | undefined;
+	let hasTerminalStructuredOutputCall = false;
+	for (let i = messages.length - 1; i >= 0; i--) {
+		const msg = messages[i];
+		if (msg?.role !== "assistant") continue;
+		const toolCalls = Array.isArray(msg.content)
+			? msg.content.filter((part) => (part as { type?: string }).type === "toolCall")
+			: [];
+		if (toolCalls.length === 1) {
+			const call = toolCalls[0] as { name?: unknown; id?: unknown };
+			if (call.name === "structured_output") {
+				hasTerminalStructuredOutputCall = true;
+				terminalStructuredOutputCallId = typeof call.id === "string" && call.id.length > 0 ? call.id : undefined;
+			}
+		}
+		break;
+	}
+
 	let pending: ErrorInfo | undefined;
+	let terminalResultSeen = false;
+	let terminalResultSucceeded = false;
 	for (const msg of messages) {
 		if (!msg) continue;
 		if (msg.role === "assistant" && msg.stopReason === "error") {
@@ -494,18 +517,44 @@ export function detectSubagentError(messages: Message[]): ErrorInfo {
 		}
 		if (msg.role !== "toolResult") continue;
 		const toolName = "toolName" in msg && typeof msg.toolName === "string" ? msg.toolName : undefined;
+		const matchesTerminalCall = hasTerminalStructuredOutputCall
+			&& toolName === "structured_output"
+			&& terminalStructuredOutputCallId !== undefined
+			&& msg.toolCallId === terminalStructuredOutputCallId;
+		if (matchesTerminalCall) {
+			// The first result for the correlated call is authoritative; a later
+			// duplicate cannot turn a failed terminal result into a recovery boundary.
+			if (terminalResultSeen) continue;
+			terminalResultSeen = true;
+			terminalResultSucceeded = msg.isError === false;
+		}
 		if (msg.isError === true) {
 			const text = msg.content.find((c) => c.type === "text");
 			const details = text && "text" in text ? text.text : undefined;
 			const exitMatch = details?.match(/exit(?:ed)?\s*(?:with\s*)?(?:code|status)?\s*[:\s]?\s*(\d+)/i);
 			pending = { hasError: true, exitCode: exitMatch?.[1] ? parseInt(exitMatch[1], 10) : 1, errorType: toolName || "tool", details: details?.slice(0, 200) };
+		} else if (hasTerminalStructuredOutputCall && toolName === "structured_output" && !matchesTerminalCall) {
+			// A structured_output result that does not belong to the terminal call is
+			// not evidence of recovery.
+			continue;
 		} else if (pending && pending.errorType !== "provider") {
 			// A later successful tool call proves a tool error was recovered, but it
 			// cannot wash out an independently terminal provider failure.
 			pending = undefined;
 		}
 	}
-	return pending ?? { hasError: false };
+	if (pending) return pending;
+	// A terminal structured_output call without its own successful result is a
+	// failed transport, not a recovery boundary.
+	if (hasTerminalStructuredOutputCall && !terminalResultSucceeded) {
+		return {
+			hasError: true,
+			exitCode: 1,
+			errorType: "structured_output",
+			details: "Missing or mismatched successful structured_output tool result",
+		};
+	}
+	return { hasError: false };
 }
 
 /**

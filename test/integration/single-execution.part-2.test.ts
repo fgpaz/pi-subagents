@@ -1572,8 +1572,9 @@ if (!fs.existsSync(${JSON.stringify(holdPath)})) { console.log('{}'); } else {
 	it("direct single tool calls support outputSchema", { skip: !createSubagentExecutor ? "executor not importable" : undefined }, async () => {
 		mockPi.onCall({
 			stdoutRaw: [
+				{ type: "message_end", message: { role: "assistant", content: [{ type: "toolCall", id: "structured-direct-1", name: "structured_output", arguments: { value: { ok: true, note: "captured" } } }], model: "mock/test-model", stopReason: "toolUse", usage: { input: 100, output: 50, cacheRead: 0, cacheWrite: 0, cost: { total: 0.001 } } } },
 				{ type: "tool_execution_start", toolName: "structured_output", args: { value: { ok: true, note: "captured" } } },
-				{ type: "tool_result_end", message: { role: "toolResult", toolName: "structured_output", content: [{ type: "text", text: "Structured output captured." }] } },
+				{ type: "tool_result_end", message: { role: "toolResult", toolCallId: "structured-direct-1", toolName: "structured_output", isError: false, content: [{ type: "text", text: "Structured output captured." }] } },
 				{ type: "tool_execution_end", toolName: "structured_output" },
 			].map((entry) => JSON.stringify(entry)).join("\n") + "\n",
 			structuredOutputCapture: { ok: true, note: "captured" },
@@ -1593,6 +1594,45 @@ if (!fs.existsSync(${JSON.stringify(holdPath)})) { console.log('{}'); } else {
 		assert.deepEqual(child?.structuredOutput, { ok: true, note: "captured" });
 		assert.match(child?.finalOutput ?? "", /"ok": true/);
 		if (child?.artifactPaths?.outputPath) assert.match(fs.readFileSync(child.artifactPaths.outputPath, "utf-8"), /"note": "captured"/);
+	});
+
+	it("foreground structured output boundary forgives a prior tool error with or without an intro", { skip: !createSubagentExecutor ? "executor not importable" : undefined }, async () => {
+		const executor = makeExecutor([makeAgent("echo")]);
+		for (const [label, intro] of [["intro", "Final report:"], ["no-intro", undefined]] as const) {
+			const callId = `foreground-structured-${label}`;
+			mockPi.onCall({
+				stdoutRaw: [
+					{ type: "tool_result_end", message: { role: "toolResult", toolCallId: `${callId}-read`, toolName: "read", isError: true, content: [{ type: "text", text: "ENOENT: no such file or directory" }] } },
+					{
+						type: "message_end",
+						message: {
+							role: "assistant",
+							content: [
+								...(intro === undefined ? [] : [{ type: "text", text: intro }]),
+								{ type: "toolCall", id: callId, name: "structured_output", arguments: { value: { ok: true } } },
+							],
+							model: "mock/test-model",
+							stopReason: "toolUse",
+							usage: { input: 10, output: 5, cacheRead: 0, cacheWrite: 0, cost: { total: 0.001 } },
+						},
+					},
+					{ type: "tool_execution_start", toolName: "structured_output", args: { value: { ok: true } } },
+					{ type: "tool_result_end", message: { role: "toolResult", toolCallId: callId, toolName: "structured_output", isError: false, content: [{ type: "text", text: "Structured output captured." }] } },
+					{ type: "tool_execution_end", toolName: "structured_output" },
+				].map((entry) => JSON.stringify(entry)).join("\n") + "\n",
+				structuredOutputCapture: { ok: true },
+			});
+
+			const result = await executor.execute(
+				`foreground-structured-${label}`,
+				{ agent: "echo", task: "Return structured data", outputSchema: { type: "object", required: ["ok"], properties: { ok: { type: "boolean" } } }, acceptance: false },
+				new AbortController().signal,
+				undefined,
+				makeMinimalCtx(tempDir),
+			);
+			assert.equal(result.isError, undefined);
+			assert.deepEqual(result.details?.results?.[0]?.structuredOutput, { ok: true });
+		}
 	});
 
 	it("routes retained workflow follow-ups to distinct outputs without overwriting the writer report", { skip: !createSubagentExecutor ? "executor not importable" : undefined }, async () => {
@@ -2170,7 +2210,7 @@ if (!fs.existsSync(${JSON.stringify(holdPath)})) { console.log('{}'); } else {
 					},
 				},
 				{ type: "tool_execution_start", toolName: "structured_output", args: { value: { ok: true } } },
-				{ type: "tool_result_end", message: { role: "toolResult", toolName: "structured_output", content: [{ type: "text", text: "Structured output captured." }] } },
+				{ type: "tool_result_end", message: { role: "toolResult", toolCallId: "structured-1", toolName: "structured_output", isError: false, content: [{ type: "text", text: "Structured output captured." }] } },
 				{ type: "tool_execution_end", toolName: "structured_output" },
 			].map((entry) => JSON.stringify(entry)).join("\n") + "\n",
 			structuredOutputCapture: { ok: true },

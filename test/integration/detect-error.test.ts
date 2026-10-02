@@ -53,6 +53,29 @@ function assistantToolCall(toolName: string): Record<string, unknown> {
 	};
 }
 
+function terminalStructuredOutputCall(intro: string | undefined, id = "structured-terminal"): Record<string, unknown> {
+	return {
+		role: "assistant",
+		content: [
+			...(intro === undefined ? [] : [{ type: "text", text: intro }]),
+			{ type: "toolCall", id, name: "structured_output", arguments: { value: { ok: true } } },
+		],
+		api: "test",
+		provider: "test",
+		model: "test",
+	};
+}
+
+function structuredOutputResult(id: string, isError = false, toolName = "structured_output"): Record<string, unknown> {
+	return {
+		role: "toolResult",
+		toolCallId: id,
+		toolName,
+		content: [{ type: "text", text: isError ? "structured output failed" : "Structured output captured." }],
+		isError,
+	};
+}
+
 describe("detectSubagentError", { skip: !available ? "utils not importable" : undefined }, () => {
 	// ---- Basic detection (must still work) ----
 
@@ -144,6 +167,51 @@ describe("detectSubagentError", { skip: !available ? "utils not importable" : un
 		const result = detectSubagentError(messages);
 		assert.equal(result.hasError, false,
 			"fatal pattern before agent's text response = recovered");
+	});
+
+	it("uses a matched terminal structured_output result as recovery boundary with an intro", () => {
+		const messages = [
+			toolResult("read", "ENOENT: no such file or directory", true),
+			terminalStructuredOutputCall("Final report:"),
+			structuredOutputResult("structured-terminal"),
+		];
+		assert.equal(detectSubagentError(messages).hasError, false);
+	});
+
+	it("uses a matched terminal structured_output result as recovery boundary without an intro", () => {
+		const messages = [
+			toolResult("ls", "ENOENT: no such file or directory", true),
+			terminalStructuredOutputCall(undefined),
+			structuredOutputResult("structured-terminal"),
+		];
+		assert.equal(detectSubagentError(messages).hasError, false);
+	});
+
+	it("does not use an unrelated structured_output result as a recovery boundary", () => {
+		const messages = [
+			toolResult("read", "ENOENT: no such file or directory", true),
+			terminalStructuredOutputCall(undefined, "expected-call"),
+			structuredOutputResult("unrelated-call"),
+		];
+		const result = detectSubagentError(messages);
+		assert.equal(result.hasError, true);
+		assert.equal(result.errorType, "read");
+	});
+
+	it("keeps a failed terminal structured_output result failed", () => {
+		const messages = [
+			terminalStructuredOutputCall(undefined, "failed-call"),
+			structuredOutputResult("failed-call", true),
+		];
+		const result = detectSubagentError(messages);
+		assert.equal(result.hasError, true);
+		assert.equal(result.errorType, "structured_output");
+	});
+
+	it("keeps a terminal structured_output call with no result failed", () => {
+		const result = detectSubagentError([terminalStructuredOutputCall(undefined, "missing-call")]);
+		assert.equal(result.hasError, true);
+		assert.equal(result.errorType, "structured_output");
 	});
 
 	// ---- Errors AFTER the last assistant text response are still caught ----
